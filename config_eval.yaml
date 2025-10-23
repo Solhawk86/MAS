@@ -1,0 +1,34 @@
+# config_eval.yaml
+student:
+  arch: "vit_large" # backbone 名称
+  patch_size: 16
+  drop_path_rate: 0.0
+  pos_embed_rope_base: 10000
+  pos_embed_rope_min_period: null
+  pos_embed_rope_max_period: null
+  pos_embed_rope_normalize_coords: true
+  pos_embed_rope_shift_coords: false
+  pos_embed_rope_jitter_coords: false
+  pos_embed_rope_rescale_coords: false
+  qkv_bias: true
+  layerscale: 1e-5
+  norm_layer: "nn.LayerNorm"
+  ffn_layer: "nn.Linear"
+  ffn_bias: true
+  proj_bias: true
+  n_storage_tokens: 0
+  mask_k_bias: false
+  untie_cls_and_patch_norms: false
+  untie_global_and_local_cls_norm: false
+  fp8_enabled: false
+  fp8_filter: ""
+crops:
+  global_crops_size: 512 
+pretrained_weights: "/mnt/mydata/DINOv3/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth" 
+input_images:
+  paths:
+    - ""  # 待处理原图路径
+  dataset_name: ""
+train:
+  batchsize: 16
+  step: 10000
