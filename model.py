@@ -11,6 +11,7 @@ from collections.abc import Iterable, Mapping, MutableMapping
 from typing import Any, Union
 from utils import *
 from dinov3.eval.segmentation.models import BackboneLayersSet, ModelWithIntermediateLayers
+from Dino_LoRA import inject_lora_qv_into_vit, LoRA_qkv
 from dinov3.models import build_model_for_eval  
 
 
@@ -33,6 +34,12 @@ class DualImageDINOv3(nn.Module):
         backbone_type: str | None = None,
         backbone_out_layers=BackboneLayersSet.FOUR_EVEN_INTERVALS,
         device: str = "cuda",
+        # LoRA 注入相关可选参数
+        lora_layers: int | list[int] | str | None = None,
+        lora_rank: int = 8,
+        lora_alpha: float = 16.0,
+        lora_dropout: float = 0.0,
+        train_mode: bool | None = None,
     ):
         super(DualImageDINOv3, self).__init__()
         self.device = torch.device(device)
@@ -57,23 +64,45 @@ class DualImageDINOv3(nn.Module):
         self.backbone.to(self.device)
         self.backbone.requires_grad_(False)
 
+        # 在冻结原模型参数后，对指定层的 q 和 v 注入 LoRA
+        self._lora_enabled = lora_layers is not None
+        if self._lora_enabled:
+            inject_lora_qv_into_vit(
+                self.backbone,
+                layers=lora_layers,
+                rank=lora_rank,
+                alpha=lora_alpha,
+                dropout=lora_dropout,
+            )
+
+        # 记录默认的训练模式：若显式传入则使用传入值，否则在启用 LoRA 时默认允许梯度
+        self._train_mode_default = self._lora_enabled if train_mode is None else train_mode
+
         # 封装成可提取中间层输出的模型
         autocast_device_type = "cuda" if self.device.type == "cuda" else self.device.type
-        backbone_indices = self._resolve_backbone_out_layers(self.backbone, backbone_out_layers)
+        self._backbone_indices = self._resolve_backbone_out_layers(self.backbone, backbone_out_layers)
+        self._autocast_ctx = partial(
+            torch.autocast,
+            device_type=autocast_device_type,
+            enabled=self.device.type == "cuda",
+            dtype=torch.float32,
+        )
         self.feature_extractor = ModelWithIntermediateLayers(   #官方实现，返回输入的feature
             self.backbone,
-            n=backbone_indices,
-            autocast_ctx=partial(
-                torch.autocast,
-                device_type=autocast_device_type,
-                enabled=self.device.type == "cuda",
-                dtype=torch.float32,
-            ),
+            n=self._backbone_indices,
+            autocast_ctx=self._autocast_ctx,
             reshape=False,
             return_class_token=False,
         )
 
-    def forward(self, img1, img2):
+        # LoRA 层需要保持可训练（默认 requires_grad=True）。显式确认其状态，防止意外被冻结
+        if self._lora_enabled:
+            for module in self.backbone.modules():
+                if isinstance(module, LoRA_qkv):
+                    for param in module.parameters():
+                        param.requires_grad = True
+
+    def forward(self, img1, img2, *, train_mode: bool | None = None):
         """
         输入：
             img1: 原始图像，shape [B, 3, H, W]
@@ -81,10 +110,36 @@ class DualImageDINOv3(nn.Module):
         输出：
             feat1, feat2: 两个图像的特征列表（通常包含4层）
         """
-        with torch.no_grad():
-            feat1 = self.feature_extractor(img1.to(self.device))
-            feat2 = self.feature_extractor(img2.to(self.device))
+        img1 = img1.to(self.device)
+        img2 = img2.to(self.device)
+        
+        mode = self._train_mode_default if train_mode is None else train_mode
+
+        if mode:
+            feat1 = self._forward_with_grad(img1)
+            feat2 = self._forward_with_grad(img2)
+        else:
+            feat1 = self._forward_inference(img1)
+            feat2 = self._forward_inference(img2)
         return feat1, feat2
+
+    def _forward_with_grad(self, images: torch.Tensor):
+        '''
+        训练模式下获取中间层特征，允许梯度在 LoRA 中回传
+        层配置参考_resolve_backbone_out_layers
+        '''
+        with self._autocast_ctx():
+            features = self.backbone.get_intermediate_layers(
+                images,
+                n=self._backbone_indices,
+                reshape=False,
+                return_class_token=False,
+            )
+        return features
+
+    def _forward_inference(self, images: torch.Tensor):
+        with torch.no_grad():
+            return self.feature_extractor(images)
 
     @staticmethod
     def _resolve_backbone_out_layers(model: nn.Module, backbone_out_layers):
