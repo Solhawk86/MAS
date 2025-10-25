@@ -1,12 +1,10 @@
 import torch
 from torch.utils.data import Dataset as TorchDataset
 from torch.utils.data import DataLoader
-from itertools import cycle
 from pathlib import Path
 from typing import Optional, Callable
 from PIL import Image
 import numpy as np
-from torchvision import transforms
 from torchvision.transforms import v2
 import torchvision.transforms.functional as TF
 
@@ -33,21 +31,20 @@ def resize_with_patch_transform(
     w_patches = int((w * image_size) / (h * patch_size))
     return TF.to_tensor(TF.resize(mask_image, (h_patches * patch_size, w_patches * patch_size)))
 
-def make_enhance_transform() -> Callable:
+def make_enhance_transform(resize_size: int | list[int] = 518) -> Callable:
     """
-    返回一个可用于 Dataset 的 transform 函数，
-    对输入 PIL.Image 图像进行增强并转换为 tensor。
-    
-    返回:
-        transform_fn(img: PIL.Image) -> torch.Tensor
+    返回用于增强图像的 transform。
+    默认包含颜色抖动 / 随机翻转，与 make_transform 保持相同的归一化。
     """
-    # 这里定义你想要的增强方法
-    # 目前示例：只做 ToTensor，你可以加其他增强，如随机翻转、亮度调整等
-    transform_fn = transforms.Compose([
-        transforms.ToTensor(),
-        # TODO :添加增强方法
-    ])
-    return transform_fn
+    augmentations = [
+        v2.ToImage(),
+        v2.Resize((resize_size, resize_size), antialias=True),
+        v2.RandomHorizontalFlip(p=0.5),
+        v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.02),
+        v2.ToDtype(torch.float32, scale=True),
+        v2.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+    ]
+    return v2.Compose(augmentations)
 
 class Dataset(TorchDataset):
     """
@@ -89,13 +86,17 @@ class Dataset(TorchDataset):
 
         # 数据增强/预处理
         if self.transform:
-            img= self.transform(img)
+            img_tensor = self.transform(img)
+        else:
+            img_tensor = make_transform()(img)
 
-        # 转为 tensor
-        img = torch.tensor(np.array(img), dtype=torch.float32).permute(2,0,1) / 255.0  # [C,H,W], 0~1
-        mask = torch.tensor(np.array(mask), dtype=torch.float32).unsqueeze(0)           # [1,H,W]
+        if img_tensor.dtype != torch.float32:
+            img_tensor = img_tensor.to(torch.float32)
 
-        return img, mask, img_path.name
+        mask_array = np.array(mask, dtype=np.float32) / 255.0
+        mask_tensor = torch.from_numpy(mask_array).unsqueeze(0)  # [1,H,W]
+
+        return img_tensor, mask_tensor, img_path.name
 
     def get_size(self, idx: int):
         """
@@ -111,7 +112,15 @@ class InfiniteDualDataloader:
     支持两路输入的无限循环 DataLoader。
     每次返回 (img_raw, img_aug)，保证对应索引配对。
     """
-    def __init__(self, raw_dataset, enhance_dataset, batch_size=32, shuffle=True, num_workers=4, max_steps:Optional[int] = None,):
+    def __init__(
+        self,
+        raw_dataset,
+        enhance_dataset,
+        batch_size=32,
+        shuffle=True,
+        num_workers=4,
+        max_steps: Optional[int] = None,
+    ):
         assert len(raw_dataset) == len(enhance_dataset), "两个数据集长度必须一致"
         self.raw_dataset = raw_dataset
         self.enhance_dataset = enhance_dataset
@@ -132,13 +141,14 @@ class InfiniteDualDataloader:
             drop_last=True
         )
 
-        # 转换成无限迭代器
-        self.raw_iter = cycle(self.raw_loader)
-        self.enhance_iter = cycle(self.enhance_loader)
+        self.raw_iter = iter(self.raw_loader)
+        self.enhance_iter = iter(self.enhance_loader)
         self.batch_size = batch_size
         self.max_steps = max_steps
+        self.step = 0
 
     def __iter__(self):
+        self.step = 0
         return self
 
     def __next__(self):
