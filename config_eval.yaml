@@ -22,13 +22,30 @@ student:
   untie_global_and_local_cls_norm: false
   fp8_enabled: false
   fp8_filter: ""
+
+model:
+  backbone_out_layers: "FOUR_EVEN_INTERVALS"  # 可设为 "LAST"、"FOUR_LAST" 或整数列表
+
 crops:
-  global_crops_size: 512 
-pretrained_weights: "/mnt/mydata/DINOv3/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth" 
+  global_crops_size: 518
+
+pretrained_weights: "/mnt/mydata/DINOv3/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
+
 input_images:
   paths:
-    - ""  # 待处理原图路径
-  dataset_name: ""
+    - "/path/to/dataset/root"  # TODO: 修改为实际数据根目录
+  dataset_name: "MAS3K"        # TODO: 修改为实际子数据集名称
+
 train:
   batchsize: 16
-  step: 10000
+  num_workers: 4
+  steps: 50000          # 超大 step，支持长时间微调
+  lora_layers: 4
+  lora_rank: 8
+  lora_alpha: 16.0
+  lora_dropout: 0.0
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  min_lr: 0.0
+  image_size: 518
+  log_interval: 50
