@@ -297,14 +297,23 @@ def train_worker(rank: int, world_size: int, cfg_path: str) -> None:
                 mask_indices_list=mask_indices_list,
                 masks_weight=masks_weight,
             )
-            if not torch.isfinite(loss):
+            loss_finite = torch.isfinite(loss)
+            if world_size > 1:
+                finite_tensor = torch.tensor(
+                    1 if loss_finite else 0, device=device, dtype=torch.int32
+                )
+                dist.all_reduce(finite_tensor, op=dist.ReduceOp.MIN)
+                loss_finite = bool(finite_tensor.item())
+
+            if not loss_finite:
                 consecutive_nan_count += 1
                 if is_rank_zero:
                     print(
-                        f"[warn] rank {rank} step {step} got non-finite loss; consecutive {consecutive_nan_count}"
+                        f"[warn] step {step} encountered non-finite loss (count {consecutive_nan_count}); skipping batch"
                     )
-                if consecutive_nan_count > exhaustive_nan and is_rank_zero:
+                if consecutive_nan_count > exhaustive_nan:
                     raise RuntimeError("Too many consecutive NaN/Inf losses, aborting training")
+                optimizer.zero_grad(set_to_none=True)
                 continue
 
         scaler.scale(loss).backward()
