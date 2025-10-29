@@ -27,25 +27,74 @@ model:
   backbone_out_layers: "FOUR_EVEN_INTERVALS"  # 可设为 "LAST"、"FOUR_LAST" 或整数列表
 
 crops:
-  global_crops_size: 518
+  global_crops_size: 224
 
 pretrained_weights: "/mnt/mydata/DINOv3/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
 
 input_images:
   paths:
-    - "/path/to/dataset/root"  # TODO: 修改为实际数据根目录
+    - "/home/yangyan/hong/MAS/data/dataset"  # TODO: 修改为实际数据根目录
   dataset_name: "MAS3K"        # TODO: 修改为实际子数据集名称
+  image_subdir: "train/Image"  # 训练默认读取的数据子目录（若不存在会回退）
 
 train:
-  batchsize: 16
-  num_workers: 4
-  steps: 50000          # 超大 step，支持长时间微调
-  lora_layers: 4
+  batchsize: 24              # 官方默认每卡 64，如显存不足可下调
+  num_workers: 8
+  steps: 125000              # 官方 100 epoch * 1250 iter
+  lora_layers: 24
   lora_rank: 8
   lora_alpha: 16.0
   lora_dropout: 0.0
-  lr: 1.0e-4
-  weight_decay: 1.0e-4
-  min_lr: 0.0
-  image_size: 518
+  lr: 1.0e-3
+  weight_decay: 4.0e-2
+  min_lr: 1.0e-6
+  image_size: 224
   log_interval: 50
+  warmup_steps: 12500        # 10 epoch warmup (1250 iter/epoch)
+  warmup_start_lr: 0.0
+  grad_clip_norm: 3.0
+  checkpoint_interval: 10000
+  checkpoint_dir: "checkpoints"
+
+ssl:
+  data:
+    local_crops_number: 8
+    local_crops_size: 96
+    global_crops_scale: [0.32, 1.0]
+    local_crops_scale: [0.05, 0.32]
+    mask_ratio_min_max: [0.1, 0.5]
+    mask_probability: 0.5
+    mask_random_circular_shift: false
+    share_color_jitter: false
+    horizontal_flips: true
+  dino:
+    head_n_prototypes: 65536
+    head_bottleneck_dim: 256
+    head_hidden_dim: 2048
+    head_nlayers: 3
+    head_norm_last_layer: false
+    loss_weight: 1.0
+    global_ignore_diagonal: true
+    student_temp: 0.1
+    teacher_temp:
+      base: 0.04
+      final: 0.07
+      warmup_iters: 12500
+    center_momentum: 0.9
+    koleo_loss_weight: 0.1
+    koleo_loss_distributed: false
+  ibot:
+    head_n_prototypes: 65536
+    head_bottleneck_dim: 256
+    head_hidden_dim: 2048
+    head_nlayers: 3
+    head_norm_last_layer: false
+    loss_weight: 1.0
+    student_temp: 0.1
+    center_momentum: 0.9
+    mask_sample_probability: 0.5
+  koleo:
+    loss_weight: 0.1
+  ema:
+    base: 0.992
+    final: 1.0

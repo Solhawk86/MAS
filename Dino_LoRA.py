@@ -17,12 +17,17 @@ class LoRA_qkv(nn.Module):
         self.scaling = rank / alpha
         self.dropout = nn.Dropout(dropout)
 
+        self.in_features = getattr(self.qkv, "in_features", None)
+        self.out_features = getattr(self.qkv, "out_features", None)
+        if self.in_features is None or self.out_features is None:
+            raise AttributeError("LoRA_qkv 需要底层 qkv 线性层提供 in_features/out_features 属性")
+
         # 冻结原始 qkv 权重
         for p in self.qkv.parameters():
             p.requires_grad = False
 
-        in_features = self.qkv.in_features
-        out_per_part = self.qkv.out_features // 3  # C（即每个 q/k/v 的维度）
+        in_features = self.in_features
+        out_per_part = self.out_features // 3  # C（即每个 q/k/v 的维度）
 
         device = self.qkv.weight.device
         dtype = self.qkv.weight.dtype
@@ -40,6 +45,14 @@ class LoRA_qkv(nn.Module):
         nn.init.zeros_(self.lora_b_v.weight)
 
         self.out_per_part = out_per_part
+
+    @property
+    def weight(self):
+        return self.qkv.weight
+
+    @property
+    def bias(self):
+        return self.qkv.bias
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # 基础 qkv 变换
