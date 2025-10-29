@@ -89,5 +89,11 @@ def main():
 #     image_with_masks = to_pil_image(image_with_masks)
 #     image_with_masks.save("/home/mil201/hong/MAS/data/results/MAS3K_with_EoMT/MAS_Arthropod_Crab_Cam_362_with_masks.jpg")
 
+def test_head():
+    import torch
+    ckpt = torch.load("/mnt/mydata/DINOv3/dinov3_vit7b16_pretrain_lvd1689m-a955f4ea.pth", map_location="cpu")
+    print(any("dino_head" in k for k in ckpt.keys()))
+    print(any("ibot_head" in k for k in ckpt.keys()))
+
 if __name__ == "__main__":
-    main()
+    test_head()

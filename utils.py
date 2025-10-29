@@ -1,8 +1,11 @@
-import yaml
+import os
+import socket
 from copy import deepcopy
 from types import SimpleNamespace
 from collections.abc import Mapping, MutableMapping
-from typing import Any, Union
+from typing import Any, Callable, Sequence, Union
+
+import yaml
 
 
 CfgLike = Union[str, Mapping[str, Any]]
@@ -141,3 +144,134 @@ def _normalize_student_cfg(student_cfg: MutableMapping[str, Any]) -> None:
     student_cfg.setdefault("pos_embed_rope_dtype", "bf16")
     student_cfg.setdefault("patch_size", 16)
     student_cfg.setdefault("arch", student_cfg.get("arch", "dino_vitl16"))
+
+
+# ---------------------------------------------------------------------------
+# 多卡 / 多进程训练辅助工具
+# ---------------------------------------------------------------------------
+
+def _find_free_tcp_port() -> int:
+    """Find a free TCP port for distributed init."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("", 0))
+        return sock.getsockname()[1]
+
+
+def _infer_device_indices(devices: int | Sequence[int] | str) -> list[int | None]:
+    import torch
+
+    if devices == "auto":
+        if torch.cuda.is_available():
+            return list(range(torch.cuda.device_count()))
+        return [None]
+    if isinstance(devices, int):
+        if devices <= 0:
+            raise ValueError("devices must be > 0")
+        if torch.cuda.is_available():
+            return list(range(devices))
+        return [None] * devices
+    if isinstance(devices, (list, tuple)):
+        return [int(d) if d is not None else None for d in devices]
+    raise TypeError("devices 参数需为 'auto'、整数或整数列表")
+
+
+def _setup_process_group(
+    *,
+    rank: int,
+    world_size: int,
+    device_indices: Sequence[int | None],
+    backend: str,
+    init_method: str,
+) -> None:
+    import torch
+    import torch.distributed as dist
+
+    master_addr = "127.0.0.1"
+    master_port = init_method.rsplit(":", 1)[-1]
+    os.environ["MASTER_ADDR"] = master_addr
+    os.environ["MASTER_PORT"] = master_port
+    os.environ["RANK"] = str(rank)
+    os.environ["LOCAL_RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+    os.environ["LOCAL_WORLD_SIZE"] = str(world_size)
+
+    if device_indices[rank] is not None and torch.cuda.is_available():
+        torch.cuda.set_device(device_indices[rank])
+
+    if not dist.is_initialized():
+        dist.init_process_group(
+            backend=backend,
+            init_method=init_method,
+            world_size=world_size,
+            rank=rank,
+        )
+
+
+def _distributed_worker(
+    local_rank: int,
+    world_size: int,
+    device_indices: Sequence[int | None],
+    backend: str,
+    init_method: str,
+    fn: Callable[..., Any],
+    args: tuple,
+    kwargs: dict | None,
+) -> None:
+    import torch.distributed as dist
+
+    _setup_process_group(
+        rank=local_rank,
+        world_size=world_size,
+        device_indices=device_indices,
+        backend=backend,
+        init_method=init_method,
+    )
+
+    try:
+        fn(local_rank, world_size, *(args or ()), **(kwargs or {}))
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def launch_distributed(
+    fn: Callable[..., Any],
+    *,
+    devices: int | Sequence[int] | str = "auto",
+    backend: str | None = None,
+    args: tuple = (),
+    kwargs: dict | None = None,
+) -> None:
+    """
+    启动多进程分布式训练，参考 lightly-train 的自动设备管理。
+
+    参数:
+        fn: 训练入口函数，签名需为 fn(rank, world_size, *args, **kwargs)。
+        devices: `'auto'`、整数或 GPU 索引列表。
+        backend: 分布式后端，默认根据设备自动选择。 
+        args/kwargs: 传递给 fn 的额外参数。
+    """
+
+    import torch
+    import torch.distributed as dist
+    import torch.multiprocessing as mp
+
+    device_indices = _infer_device_indices(devices)
+    world_size = len(device_indices)
+
+    if world_size <= 1:
+        fn(0, world_size, *(args or ()), **(kwargs or {}))
+        return
+
+    if backend is None:
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+
+    port = _find_free_tcp_port()
+    init_method = f"tcp://127.0.0.1:{port}"
+
+    mp.spawn(
+        _distributed_worker,
+        args=(world_size, device_indices, backend, init_method, fn, args, kwargs),
+        nprocs=world_size,
+        join=True,
+    )

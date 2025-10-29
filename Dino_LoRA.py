@@ -21,8 +21,11 @@ class LoRA_qkv(nn.Module):
         for p in self.qkv.parameters():
             p.requires_grad = False
 
-        in_features = self.qkv.in_features
-        out_per_part = self.qkv.out_features // 3  # C（即每个 q/k/v 的维度）
+        # 缓存 Linear 属性，避免外部再访问 self.qkv 时缺失
+        self.in_features = self.qkv.in_features
+        self.out_features = self.qkv.out_features
+        in_features = self.in_features
+        out_per_part = self.out_features // 3  # C（即每个 q/k/v 的维度）
 
         device = self.qkv.weight.device
         dtype = self.qkv.weight.dtype

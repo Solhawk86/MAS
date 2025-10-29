@@ -3,16 +3,22 @@ import yaml
 import torch
 import torch.nn as nn
 import sys
+
 sys.path.append('/home/yangyan/hong/dinov3')
+
 from copy import deepcopy
 from functools import partial
 from types import SimpleNamespace
 from collections.abc import Iterable, Mapping, MutableMapping
 from typing import Any, Union
+
 from utils import *
 from dinov3.eval.segmentation.models import BackboneLayersSet, ModelWithIntermediateLayers
+from dinov3.layers.dino_head import DINOHead
 from Dino_LoRA import inject_lora_qv_into_vit, LoRA_qkv
 from dinov3.models import build_model_for_eval  
+
+# NOTE: DualImageDINOv3 保留供分割任务调用；DINOv3SelfSupervised 则负责自监督 LoRA 训练。
 
 
 class DualImageDINOv3(nn.Module):
@@ -203,8 +209,283 @@ class DualImageDINOv3(nn.Module):
         if any(idx >= n_blocks or idx < 0 for idx in indices):
             raise ValueError(f"生成的层索引 {indices} 超出模型 block 范围 (0, {n_blocks - 1})")
         return indices
-    
+
+
+class DINOv3SelfSupervised(nn.Module):
+    """Student-teacher wrapper tailored for LoRA-only self-supervised pretraining."""
+
+    def __init__(
+        self,
+        cfg,
+        *,
+        device: str = "cuda",
+        lora_layers: int | list[int] | str | None = None,
+        lora_rank: int = 8,
+        lora_alpha: float = 16.0,
+        lora_dropout: float = 0.0,
+        ssl_cfg: dict | None = None,
+    ) -> None:
+        super().__init__()
+        self.device = torch.device(device)
+
+        processed_cfg_dict = prepare_dinov3_cfg(cfg)
+        self.cfg = dict_to_namespace(processed_cfg_dict)
+        self.ssl_cfg = ssl_cfg or {}
+
+        pretrained_weights = processed_cfg_dict.get("pretrained_weights")
+        if not pretrained_weights:
+            raise ValueError("自监督预训练需要配置 pretrained_weights 以初始化教师模型")
+
+        # 通过预训练权重构建教师模型，并复制给学生
+        teacher_backbone = build_model_for_eval(
+            config=self.cfg,
+            pretrained_weights=pretrained_weights,
+        )
+        teacher_backbone.to(self.device)
+        teacher_backbone.eval()
+
+        student_backbone = deepcopy(teacher_backbone)
+        student_backbone.to(self.device)
+        student_backbone.train()
+        
+        # 注入LoRA
+        self._lora_enabled = lora_layers is not None
+        if self._lora_enabled:
+            inject_lora_qv_into_vit(
+                student_backbone,
+                layers=lora_layers,
+                rank=lora_rank,
+                alpha=lora_alpha,
+                dropout=lora_dropout,
+            )
+            inject_lora_qv_into_vit(
+                teacher_backbone,
+                layers=lora_layers,
+                rank=lora_rank,
+                alpha=lora_alpha,
+                dropout=lora_dropout,
+            )
+        # 注意：teacher/backbone 仅为了结构对齐而注入 LoRA，参数由 EMA 驱动
+
+        student_backbone.requires_grad_(False)
+        teacher_backbone.requires_grad_(False)
+
+        if self._lora_enabled:
+            self._set_lora_trainable(student_backbone)
+
+        dino_head_cfg = self.ssl_cfg.get("dino", {})
+        ibot_head_cfg = self.ssl_cfg.get("ibot", {})
+
+        embed_dim = getattr(student_backbone, "embed_dim", None)
+        if embed_dim is None:
+            raise ValueError("无法在 backbone 上找到 embed_dim")
+
+        # 构建 Head
+        student_dino_head = self._build_head(embed_dim, dino_head_cfg).to(self.device)
+        student_ibot_head = self._build_head(embed_dim, ibot_head_cfg).to(self.device)
+
+        if hasattr(student_dino_head, "init_weights"):
+            student_dino_head.init_weights()
+        if hasattr(student_ibot_head, "init_weights"):
+            student_ibot_head.init_weights()
+
+        teacher_dino_head = self._build_head(embed_dim, dino_head_cfg).to(self.device)
+        teacher_ibot_head = self._build_head(embed_dim, ibot_head_cfg).to(self.device)
+
+        teacher_dino_head.load_state_dict(student_dino_head.state_dict())
+        teacher_ibot_head.load_state_dict(student_ibot_head.state_dict())
+        teacher_dino_head.requires_grad_(False)
+        teacher_ibot_head.requires_grad_(False)
+        teacher_dino_head.eval()
+        teacher_ibot_head.eval()
+
+        # student/backbone 搭配 LoRA，可训练；teacher 全量冻结，仅通过 EMA 同步
+        self.student = nn.ModuleDict(
+            {
+                "backbone": student_backbone,
+                "dino_head": student_dino_head,
+                "ibot_head": student_ibot_head,
+            }
+        )
+        self.teacher = nn.ModuleDict(
+            {
+                "backbone": teacher_backbone,
+                "dino_head": teacher_dino_head,
+                "ibot_head": teacher_ibot_head,
+            }
+        )
+        self.student.train()
+        self.teacher.eval()
+        self.teacher.requires_grad_(False)
+
+    @staticmethod
+    def _build_head(embed_dim: int, head_cfg: Mapping[str, Any]) -> DINOHead:
+        out_dim = head_cfg.get("head_n_prototypes", 8192)
+        hidden_dim = head_cfg.get("head_hidden_dim", 2048)
+        bottleneck_dim = head_cfg.get("head_bottleneck_dim", 256)
+        nlayers = head_cfg.get("head_nlayers", 3)
+        use_bn = head_cfg.get("use_bn", False)
+        mlp_bias = head_cfg.get("mlp_bias", True)
+        # DINOv3 代码中不再使用 norm_last_layer，这里保持兼容但忽略该参数
+        return DINOHead(
+            in_dim=embed_dim,
+            out_dim=out_dim,
+            hidden_dim=hidden_dim,
+            bottleneck_dim=bottleneck_dim,
+            nlayers=nlayers,
+            use_bn=use_bn,
+            mlp_bias=mlp_bias,
+        )
+
+    @staticmethod
+    def _set_lora_trainable(backbone: nn.Module) -> None:
+        for module in backbone.modules():
+            if isinstance(module, LoRA_qkv):
+                for param in module.parameters():
+                    param.requires_grad = True
+
+    def student_trainable_parameters(self) -> list[nn.Parameter]:
+        params: list[nn.Parameter] = []
+        for name, module in self.student.items():
+            if name == "backbone":
+                params.extend(p for p in module.parameters() if p.requires_grad)
+            else:
+                params.extend(module.parameters())
+        return params
+
+    @torch.no_grad()
+    def update_teacher(self, momentum: float) -> None:
+        teacher_params = []
+        student_params = []
+        for module_name in self.student.keys():
+            student_mod = self.student[module_name]
+            teacher_mod = self.teacher[module_name]
+            for sp, tp in zip(student_mod.parameters(), teacher_mod.parameters()):
+                if not tp.data.is_floating_point():
+                    continue
+                teacher_params.append(tp)
+                student_params.append(sp)
+        # 按 EMA momentum 同步教师参数，避免显存回传
+        torch._foreach_mul_(teacher_params, momentum)
+        torch._foreach_add_(teacher_params, student_params, alpha=1 - momentum)
+
+    def get_teacher_output(
+        self,
+        images: torch.Tensor,
+        *,
+        mask_indices_list: torch.Tensor,
+        teacher_temp: float,
+        n_masked_patches_tensor: torch.Tensor,
+        dino_loss,
+        ibot_loss,
+    ) -> dict[str, torch.Tensor]:
+        n_crops, B, _, H, W = images.shape
+        flat_images = images.flatten(0, 1)
+
+        with torch.no_grad():
+            backbone_out = self.teacher["backbone"](flat_images, is_training=True)
+        # 官方封装输出字典
+        # output.append(
+        #         {
+        #             "x_norm_clstoken": x_norm_cls_reg[:, 0],
+        #             "x_storage_tokens": x_norm_cls_reg[:, 1:],
+        #             "x_norm_patchtokens": x_norm_patch,
+        #             "x_prenorm": x,
+        #             "masks": masks,
+        #         }
+        cls = backbone_out["x_norm_clstoken"]
+        reg = backbone_out["x_storage_tokens"]
+        patch = backbone_out["x_norm_patchtokens"]
+
+        # 只在被遮挡的 patch 上执行 iBOT head，降低计算量
+        masked_patch_pre_head = torch.index_select(patch.flatten(0, 1), 0, mask_indices_list)
+        masked_patch_after_head = self.teacher["ibot_head"](masked_patch_pre_head)
+
+        cls_after_head = self.teacher["dino_head"](cls)
+        cls_centered = dino_loss.sinkhorn_knopp_teacher(cls_after_head, teacher_temp=teacher_temp)
+        if not torch.isfinite(cls_centered).all():
+            cls_centered = dino_loss.softmax_center_teacher(cls_after_head, teacher_temp=teacher_temp)
+        cls_centered = cls_centered.unflatten(0, (n_crops, B))
+        masked_patch_centered = ibot_loss.sinkhorn_knopp_teacher(
+            masked_patch_after_head,
+            teacher_temp=teacher_temp,
+            n_masked_patches_tensor=n_masked_patches_tensor,
+        )
+        if not torch.isfinite(masked_patch_centered).all():
+            masked_patch_centered = ibot_loss.softmax_center_teacher(
+                masked_patch_after_head.unsqueeze(1), teacher_temp=teacher_temp
+            ).squeeze(1)
+
+        return {
+            "cls_pre_head": cls.unflatten(0, (n_crops, B)),
+            "reg_pre_head": reg.unflatten(0, (n_crops, B)),
+            "patch_pre_head": patch.unflatten(0, (n_crops, B)),
+            "cls_after_head": cls_after_head.unflatten(0, (n_crops, B)),
+            "cls_centered": cls_centered,
+            "masked_patch_centered": masked_patch_centered,
+            "masked_patch_after_head": masked_patch_after_head,
+        }
+
+    def get_student_output(
+        self,
+        *,
+        global_crops: torch.Tensor,
+        local_crops: torch.Tensor,
+        masks: torch.Tensor,
+        mask_indices_list: torch.Tensor,
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        n_global_crops, B, _, H, W = global_crops.shape
+        n_local_crops, _, _, h_local, w_local = local_crops.shape
+
+        global_flat = global_crops.flatten(0, 1)
+        local_flat = local_crops.flatten(0, 1)
+
+        global_out, local_out = self.student["backbone"](
+            [global_flat, local_flat],
+            masks=[masks, None],
+            is_training=True,
+        )
+
+        g_cls = global_out["x_norm_clstoken"]
+        g_reg = global_out["x_storage_tokens"]
+        g_patch = global_out["x_norm_patchtokens"]
+        l_cls = local_out["x_norm_clstoken"]
+        l_reg = local_out["x_storage_tokens"]
+        l_patch = local_out["x_norm_patchtokens"]
+
+        masked_patches_pre_head = torch.index_select(g_patch.flatten(0, 1), 0, mask_indices_list)
+        masked_patch_after_head = self.student["ibot_head"](masked_patches_pre_head)
+
+        buffer = [g_cls, l_cls]
+        sizes = [x.shape[0] for x in buffer]
+        buffer = torch.cat(buffer, dim=0)
+        buffer = self.student["dino_head"](buffer)
+        g_cls_after_head, l_cls_after_head = torch.split(buffer, sizes, dim=0)
+
+        student_global = {
+            "cls_pre_head": g_cls.unflatten(0, (n_global_crops, B)),
+            "reg_pre_head": g_reg.unflatten(0, (n_global_crops, B)),
+            "patch_pre_head": g_patch.unflatten(0, (n_global_crops, B)),
+            "cls_after_head": g_cls_after_head.unflatten(0, (n_global_crops, B)),
+            "masked_patch_after_head": masked_patch_after_head,
+            "masked_patch_pre_head": masked_patches_pre_head,
+        }
+        student_local = {
+            "cls_pre_head": l_cls.unflatten(0, (n_local_crops, B)),
+            "reg_pre_head": l_reg.unflatten(0, (n_local_crops, B)),
+            "patch_pre_head": l_patch.unflatten(0, (n_local_crops, B)),
+            "cls_after_head": l_cls_after_head.unflatten(0, (n_local_crops, B)),
+        }
+        return student_global, student_local
+
+    def teacher_state_dict(self) -> dict[str, Any]:
+        return {k: v.state_dict() for k, v in self.teacher.items()}
+
+    def student_state_dict(self) -> dict[str, Any]:
+        return {k: v.state_dict() for k, v in self.student.items()}
+
 def test():
+    torch.cuda.set_device(2)
     device = "cuda:2" if torch.cuda.is_available() else "cpu"
 
     cfg = load_config('config_eval.yaml')
@@ -217,6 +498,14 @@ def test():
     img_aug = torch.randn(2, 3, 518, 518)
 
     feat1, feat2 = model(img, img_aug)
+    
+    print("保持进程，按 Ctrl+C 退出...")
+    try:
+        while True:
+            time.sleep(10)
+    except KeyboardInterrupt:
+        print("退出测试，释放显存")
+        
     print(f"原图特征层数: {len(feat1)}")
     for i, feat in enumerate(feat1, start=1):
         if isinstance(feat, tuple):
