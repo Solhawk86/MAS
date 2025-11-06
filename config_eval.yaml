@@ -10,7 +10,7 @@ student:
   pos_embed_rope_shift_coords: false
   pos_embed_rope_jitter_coords: false
   pos_embed_rope_rescale_coords: false
-  qkv_bias: true
+  qkv_bias: false
   layerscale: 1e-5
   norm_layer: "nn.LayerNorm"
   ffn_layer: "nn.Linear"
@@ -27,31 +27,32 @@ model:
   backbone_out_layers: "FOUR_EVEN_INTERVALS"  # 可设为 "LAST"、"FOUR_LAST" 或整数列表
 
 crops:
-  global_crops_size: 224
+  global_crops_size: 256
 
 pretrained_weights: "/mnt/mydata/DINOv3/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
 
 input_images:
   paths:
-    - "/home/yangyan/hong/MAS/data/dataset"  # TODO: 修改为实际数据根目录
-  dataset_name: "MAS3K"        # TODO: 修改为实际子数据集名称
-  image_subdir: "train/Image"  # 训练默认读取的数据子目录（若不存在会回退）
+    - "/mnt/mydata/hong/masdata"  # TODO: 修改为实际数据根目录
+  # dataset_name: "MAS3K"        # TODO: 修改为实际子数据集名称
+  # image_subdir: "train/Image"  # 训练默认读取的数据子目录（若不存在会回退）
 
 train:
-  batchsize: 24              # 官方默认每卡 64，如显存不足可下调
-  num_workers: 8
-  steps: 125000              # 官方 100 epoch * 1250 iter
+  batchsize: 12              # 官方默认每卡 64，如显存不足可下调
+  num_workers: 4
+  steps: 40000              # 官方 100 epoch * 1250 iter
   lora_layers: 24
   lora_rank: 8
   lora_alpha: 16.0
   lora_dropout: 0.0
-  lr: 1.0e-3
+  lr: 2.0e-3
   weight_decay: 4.0e-2
-  min_lr: 1.0e-6
+  min_lr: 5.0e-5
   image_size: 224
   log_interval: 50
-  warmup_steps: 12500        # 10 epoch warmup (1250 iter/epoch)
-  warmup_start_lr: 0.0
+  warmup_steps: 4000        # 10 epoch warmup (1250 iter/epoch)
+  warmup_start_lr: 4.0e-4
+  grad_accum_steps: 1
   grad_clip_norm: 3.0
   checkpoint_interval: 10000
   checkpoint_dir: "checkpoints"
@@ -67,8 +68,13 @@ ssl:
     mask_random_circular_shift: false
     share_color_jitter: false
     horizontal_flips: true
+    cache_images: false
+    cache_max_images: 2000
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 6
   dino:
-    head_n_prototypes: 65536
+    head_n_prototypes: 32768
     head_bottleneck_dim: 256
     head_hidden_dim: 2048
     head_nlayers: 3
@@ -79,12 +85,12 @@ ssl:
     teacher_temp:
       base: 0.04
       final: 0.07
-      warmup_iters: 12500
+      warmup_iters: 4000
     center_momentum: 0.9
     koleo_loss_weight: 0.1
     koleo_loss_distributed: false
   ibot:
-    head_n_prototypes: 65536
+    head_n_prototypes: 32768
     head_bottleneck_dim: 256
     head_hidden_dim: 2048
     head_nlayers: 3
@@ -98,3 +104,17 @@ ssl:
   ema:
     base: 0.992
     final: 1.0
+
+cosine_viz:
+  backbone_out_layers: "LAST"    # 余弦相似度可视化使用的特征层
+  layer: null                    # 可指定 Transformer 层索引，null 表示默认
+  patch_coords:  null
+    # [35, 40]            # 默认取中心 patch，可设为 [i, j]
+  cmap: "viridis"                # 颜色映射
+  output_dir: "cosine_outputs"   # 热力图输出目录
+  device: "cuda"                 # 推理设备，可选 "cuda" / "cpu"
+  images:
+    - "/home/yangyan/hong/MAS/MAS_MarineFish_Butterflyfish_Com_999.jpg"  # 待可视化的图像路径列表
+  resize_to_original: true       # 是否将热力图缩放回原始图像尺寸
+  output_scale: null             # 可选缩放倍率，优先于 resize_to_original
+  normalize: "local"            # 热力图归一化模式，可选 "global"[0,1] / "local" 按当前热力图最小/最大值重新归一化

@@ -2,7 +2,9 @@ import time
 import yaml
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import sys
+import matplotlib.pyplot as plt
 
 sys.path.append('/home/yangyan/hong/dinov3')
 
@@ -17,6 +19,7 @@ from dinov3.eval.segmentation.models import BackboneLayersSet, ModelWithIntermed
 from dinov3.layers.dino_head import DINOHead
 from Dino_LoRA import inject_lora_qv_into_vit, LoRA_qkv
 from dinov3.models import build_model_for_eval  
+from torch.nn.parallel import DistributedDataParallel
 
 # NOTE: DualImageDINOv3 保留供分割任务调用；DINOv3SelfSupervised 则负责自监督 LoRA 训练。
 
@@ -91,7 +94,7 @@ class DualImageDINOv3(nn.Module):
             torch.autocast,
             device_type=autocast_device_type,
             enabled=self.device.type == "cuda",
-            dtype=torch.float32,
+            dtype=torch.bfloat16,
         )
         self.feature_extractor = ModelWithIntermediateLayers(   #官方实现，返回输入的feature
             self.backbone,
@@ -338,6 +341,51 @@ class DINOv3SelfSupervised(nn.Module):
                 for param in module.parameters():
                     param.requires_grad = True
 
+    @staticmethod
+    def _unwrap_ddp(module: nn.Module) -> nn.Module:
+        if isinstance(module, DistributedDataParallel):
+            return module.module
+        return module
+
+    def _safe_sinkhorn(
+        self,
+        sinkhorn_fn,
+        logits: torch.Tensor,
+        *,
+        teacher_temp: float,
+        extra_kwargs: dict[str, Any] | None = None,
+    ) -> torch.Tensor:
+        if logits.numel() == 0:
+            return logits
+        safe_temp = max(float(teacher_temp), 1e-4)
+        kwargs: dict[str, Any] = {"teacher_temp": safe_temp}
+        if extra_kwargs:
+            kwargs.update(extra_kwargs)
+        total_masked = None
+        if "n_masked_patches_tensor" in kwargs:
+            masked_value = kwargs["n_masked_patches_tensor"]
+            if torch.is_tensor(masked_value):
+                try:
+                    total_masked = int(masked_value.sum().item())
+                except RuntimeError:
+                    total_masked = int(masked_value.sum().cpu().item())
+            else:
+                total_masked = int(masked_value)
+        if total_masked is not None and total_masked <= 0:
+            return logits.new_zeros(logits.shape, dtype=logits.dtype)
+        try:
+            probs = sinkhorn_fn(logits, **kwargs)
+            if torch.isfinite(probs).all():
+                return probs
+        except RuntimeError as err:
+            message = str(err).lower()
+            if not any(token in message for token in ("div", "nan", "inf", "zero")):
+                raise
+        logits_fp32 = logits.float()
+        logits_fp32 = logits_fp32 - logits_fp32.max(dim=-1, keepdim=True).values
+        fallback = torch.softmax(logits_fp32 / safe_temp, dim=-1)
+        return fallback
+
     def student_trainable_parameters(self) -> list[nn.Parameter]:
         params: list[nn.Parameter] = []
         for name, module in self.student.items():
@@ -396,12 +444,17 @@ class DINOv3SelfSupervised(nn.Module):
         masked_patch_after_head = self.teacher["ibot_head"](masked_patch_pre_head)
 
         cls_after_head = self.teacher["dino_head"](cls)
-        cls_centered = dino_loss.sinkhorn_knopp_teacher(cls_after_head, teacher_temp=teacher_temp)  #温度归一化
-        cls_centered = cls_centered.unflatten(0, (n_crops, B))
-        masked_patch_centered = ibot_loss.sinkhorn_knopp_teacher(
+        cls_centered_flat = self._safe_sinkhorn(
+            dino_loss.sinkhorn_knopp_teacher,
+            cls_after_head,
+            teacher_temp=teacher_temp,
+        )  #温度归一化
+        cls_centered = cls_centered_flat.unflatten(0, (n_crops, B))
+        masked_patch_centered = self._safe_sinkhorn(
+            ibot_loss.sinkhorn_knopp_teacher,
             masked_patch_after_head,
             teacher_temp=teacher_temp,
-            n_masked_patches_tensor=n_masked_patches_tensor,
+            extra_kwargs={"n_masked_patches_tensor": n_masked_patches_tensor},
         )
 
         return {
@@ -470,7 +523,7 @@ class DINOv3SelfSupervised(nn.Module):
         return {k: v.state_dict() for k, v in self.teacher.items()}
 
     def student_state_dict(self) -> dict[str, Any]:
-        return {k: v.state_dict() for k, v in self.student.items()}
+        return {k: self._unwrap_ddp(v).state_dict() for k, v in self.student.items()}
 
 def test():
     torch.cuda.set_device(2)

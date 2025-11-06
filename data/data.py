@@ -1,13 +1,15 @@
 import random
+from collections import OrderedDict
 from functools import partial
 from pathlib import Path
-from typing import Optional, Callable, Iterable
+from typing import Optional, Callable, Any
 
 import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset as TorchDataset
+from torch.utils.data.distributed import DistributedSampler
 from torchvision.transforms import v2
 import torchvision.transforms.functional as TF
 
@@ -176,46 +178,28 @@ class InfiniteDualDataloader:
 
 class ImagesOnlyDataset(TorchDataset):
 
-    _DEFAULT_SUBDIRS: tuple[str, ...] = (
-        "train/Image",
-        "train/images",
-        "images/train",
-        "Image",
-        "images",
-        "train",
-        "val/Image",
-        "val/images",
-        ".",
-    )
-
     def __init__(
         self,
         base_dir: str,
-        dataset_name: str,
         *,
-        image_subdir: str | Iterable[str] | None = None,
         transform: Optional[Callable[[Image.Image], dict]] = None,
         recursive: bool = False,
+        cache_images: bool = False,
+        cache_max_images: int | None = None,
     ) -> None:
-        self.root = Path(base_dir) / dataset_name
+        self.root = Path(base_dir)
         if not self.root.exists():
             raise ValueError(f"Dataset root {self.root} does not exist")
 
         # transform 会返回多尺度裁剪与 teacher/student 视角，后续在 collate_fn 中打包
         self.transform = transform
         self.recursive = recursive
-        subdir_candidates: list[str] = []
-        if image_subdir is not None:
-            if isinstance(image_subdir, str):
-                subdir_candidates.append(image_subdir)
-            else:
-                subdir_candidates.extend(image_subdir)
-        subdir_candidates.extend([s for s in self._DEFAULT_SUBDIRS if s not in subdir_candidates])
-
-        self.img_dir = self._resolve_img_dir(subdir_candidates)
-        self.img_paths = self._scan_images(self.img_dir)
+        self.cache_images = cache_images
+        self.cache_max_images = cache_max_images
+        self._image_cache: OrderedDict[int, Image.Image] = OrderedDict()
+        self.img_paths = self._scan_images(self.root)
         if not self.img_paths:
-            raise ValueError(f"No image files found under {self.img_dir}")
+            raise ValueError(f"No image files found under {self.root}")
 
     def _scan_images(self, directory: Path) -> list[Path]:
         exts = {".jpg", ".jpeg", ".png", ".bmp", ".tiff"}
@@ -225,41 +209,45 @@ class ImagesOnlyDataset(TorchDataset):
             iterator = directory.iterdir()
         return sorted(p for p in iterator if p.is_file() and p.suffix.lower() in exts)
 
-    def _resolve_img_dir(self, candidates: Iterable[str]) -> Path:
-        for cand in candidates:
-            candidate_path = (self.root / cand).resolve()
-            if candidate_path.is_dir():
-                if any(candidate_path.glob("*")):
-                    return candidate_path
-        raise ValueError(
-            f"Unable to locate an image folder under {self.root}. Tried: {', '.join(str(c) for c in candidates)}"
-        )
-
     def __len__(self) -> int:  # type: ignore[override]
         return len(self.img_paths)
 
     def __getitem__(self, idx: int):  # type: ignore[override]
         img_path = self.img_paths[idx]
-        with Image.open(img_path) as img:
-            img = img.convert("RGB")
-            if self.transform is None:
-                raise RuntimeError("ImagesOnlyDataset requires a transform that returns multi-view crops")
-            sample = self.transform(img)
+        if self.cache_images:
+            cached = self._image_cache.get(idx)
+            if cached is None:
+                with Image.open(img_path) as img:
+                    cached = img.convert("RGB").copy()
+                self._image_cache[idx] = cached
+                if self.cache_max_images is not None and len(self._image_cache) > self.cache_max_images:
+                    self._image_cache.popitem(last=False)
+            else:
+                self._image_cache.move_to_end(idx)
+            img = self._image_cache[idx].copy()
+        else:
+            with Image.open(img_path) as img_obj:
+                img = img_obj.convert("RGB")
+
+        if self.transform is None:
+            raise RuntimeError("ImagesOnlyDataset requires a transform that returns multi-view crops")
+        sample = self.transform(img)
         metadata = {"path": str(img_path)}
         return sample, metadata
 
 
 def build_ssl_dataloader(
     *,
-    base_dir: str,
-    dataset_name: str,
-    image_subdir: str | Iterable[str] | None,
+    data_dir: str,
     batch_size: int,
     num_workers: int,
     ssl_cfg: dict,
     patch_size: int,
     dtype: torch.dtype = torch.float32,
     seed: int | None = None,
+    distributed: bool = False,
+    num_replicas: int | None = None,
+    rank: int | None = None,
 ) -> DataLoader:
     """Construct a DINOv3-style multi-crop loader for self-supervised pretraining."""
 
@@ -278,6 +266,13 @@ def build_ssl_dataloader(
     local_crops_scale = tuple(data_cfg.get("local_crops_scale", (0.05, 0.4)))
     share_color_jitter = bool(data_cfg.get("share_color_jitter", False))
     horizontal_flips = bool(data_cfg.get("horizontal_flips", True))
+    cache_images = bool(data_cfg.get("cache_images", False))
+    cache_max_images = data_cfg.get("cache_max_images")
+    if cache_max_images is not None:
+        cache_max_images = int(cache_max_images)
+    pin_memory = bool(data_cfg.get("pin_memory", True))
+    persistent_workers = bool(data_cfg.get("persistent_workers", True)) if num_workers > 0 else False
+    prefetch_factor = int(data_cfg.get("prefetch_factor", 4)) if num_workers > 0 else None
 
     augmentation = DataAugmentationDINO(
         global_crops_scale=global_crops_scale,
@@ -290,10 +285,11 @@ def build_ssl_dataloader(
     )
 
     dataset = ImagesOnlyDataset(
-        base_dir=base_dir,
-        dataset_name=dataset_name,
-        image_subdir=image_subdir,
+        base_dir=data_dir,
         transform=augmentation,
+        cache_images=cache_images,
+        recursive=bool(data_cfg.get("recursive", False)),
+        cache_max_images=cache_max_images,
     )
 
     input_size = global_crops_size // patch_size
@@ -317,13 +313,39 @@ def build_ssl_dataloader(
         random_circular_shift=random_circular_shift,
     )
 
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        drop_last=True,
-        num_workers=num_workers,
-        pin_memory=True,
-        collate_fn=collate_fn,
-    )
+    sampler = None
+    if distributed:
+        if num_replicas is None:
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                num_replicas = torch.distributed.get_world_size()
+            else:
+                num_replicas = torch.cuda.device_count() if torch.cuda.is_available() else 1
+        if rank is None:
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                rank = torch.distributed.get_rank()
+            else:
+                rank = 0
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=num_replicas,
+            rank=rank,
+            shuffle=True,
+            drop_last=True,
+        )
+
+    loader_kwargs: dict[str, Any] = {
+        "dataset": dataset,
+        "persistent_workers": persistent_workers,
+        "batch_size": batch_size,
+        "shuffle": sampler is None,
+        "drop_last": True,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "collate_fn": collate_fn,
+        "sampler": sampler,
+    }
+    if prefetch_factor is not None:
+        loader_kwargs["prefetch_factor"] = max(2, prefetch_factor)
+
+    loader = DataLoader(**loader_kwargs)
     return loader
