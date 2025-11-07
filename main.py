@@ -18,7 +18,9 @@ from utils import (
     _ensure_dir,
     _ensure_torch_fsdp_compat,
     _setup_device_and_distributed,
+    create_tensorboard_writer,
     load_config,
+    tensorboard_log_scalars,
 )
 
 # NOTE: 训练脚本遵循 DINOv3 自监督范式，仅更新 LoRA + 头部参数。四卡 3090 建议调整 batchsize.
@@ -46,6 +48,9 @@ def train() -> None:
     checkpoint_interval = int(train_cfg.get("checkpoint_interval", 0))
     checkpoint_dir = train_cfg.get("checkpoint_dir", "checkpoints")
     grad_accum_steps = max(1, int(train_cfg.get("grad_accum_steps", 1)))
+    tensorboard_enabled = bool(train_cfg.get("tensorboard_enabled", False))
+    tensorboard_log_dir = train_cfg.get("tensorboard_log_dir")
+    tb_writer = create_tensorboard_writer(tensorboard_log_dir, rank, tensorboard_enabled)
 
     #2、配置 LoRA 微调参数，仅训练 LoRA 层和head。
     lora_layers = train_cfg.get("lora_layers", 4)
@@ -251,11 +256,32 @@ def train() -> None:
         loss_val = float(loss_mean.cpu())
 
         if is_main_process:
+            raw_loss_scalars: dict[str, float] = {
+                "loss_raw/total": loss_val,
+            }
+            if reduced_terms:
+                for metric_name in ("dino_global", "dino_local", "ibot", "koleo"):
+                    if metric_name in reduced_terms:
+                        raw_loss_scalars[f"loss_raw/{metric_name}"] = float(reduced_terms[metric_name].cpu())
+
             running_metrics.setdefault("loss", loss_val)
             running_metrics["loss"] = running_metrics["loss"] * 0.9 + loss_val * 0.1
             for key, tensor_val in reduced_terms.items():
                 val = float(tensor_val.cpu())
                 running_metrics[key] = running_metrics.get(key, val) * 0.9 + val * 0.1
+
+            smoothed_scalars: dict[str, float] = {
+                "loss/total": running_metrics["loss"],
+                "optim/lr": lr_this_step,
+                "sched/teacher_temp": teacher_temp,
+                "sched/momentum": momentum,
+            }
+            for metric_name in ("dino_global", "dino_local", "ibot", "koleo"):
+                if metric_name in running_metrics:
+                    smoothed_scalars[f"loss/{metric_name}"] = running_metrics[metric_name]
+
+            tensorboard_log_scalars(tb_writer, update_step, raw_loss_scalars)
+            tensorboard_log_scalars(tb_writer, update_step, smoothed_scalars)
 
             if update_step % log_interval == 0 or update_step == 1:
                 metrics_str = " ".join(f"{k}:{v:.4f}" for k, v in sorted(running_metrics.items()))
@@ -289,6 +315,9 @@ def train() -> None:
             final_ckpt,
         )
         print(f"训练结束，教师权重已保存至 {final_ckpt}")
+
+    if tb_writer is not None:
+        tb_writer.close()
 
 
 if __name__ == "__main__":

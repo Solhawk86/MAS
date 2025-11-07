@@ -1,7 +1,7 @@
-#数据文件
 data/dataset
 data/results
 AGENTS.md
 checkpoints
 cosine_similarity/input
 cosine_similarity/output
+**/__pycache__/

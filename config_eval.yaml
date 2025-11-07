@@ -45,7 +45,7 @@ train:
   lora_rank: 8
   lora_alpha: 16.0
   lora_dropout: 0.0
-  lr: 2.0e-3
+  lr: 2.0e-3                # lr = 0.0005 ∗ batchsize/256
   weight_decay: 4.0e-2
   min_lr: 5.0e-5
   image_size: 224
@@ -56,6 +56,8 @@ train:
   grad_clip_norm: 3.0
   checkpoint_interval: 10000
   checkpoint_dir: "checkpoints"
+  tensorboard_enabled: true
+  tensorboard_log_dir: "runs"
 
 ssl:
   data:

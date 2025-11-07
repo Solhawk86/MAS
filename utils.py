@@ -6,14 +6,16 @@ from pathlib import Path
 from types import SimpleNamespace
 from collections.abc import Mapping, MutableMapping
 from typing import Any, Union
-import torch.nn as nn
-import torch.nn.functional as F
+
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.nn as nn
+import torch.nn.functional as F
 import yaml
 from dinov3.distributed import enable as enable_distributed, is_enabled as dist_is_enabled
+from torch.utils.tensorboard import SummaryWriter
 
 
 CfgLike = Union[str, Mapping[str, Any]]
@@ -266,6 +268,21 @@ def _ensure_dir(path: str | Path) -> None:
     if not path:
         return
     Path(path).mkdir(parents=True, exist_ok=True)
+
+def create_tensorboard_writer(log_dir: str | Path | None, rank: int, enabled: bool = True) -> SummaryWriter | None:
+    if not enabled or rank != 0:
+        return None
+    default_dir = Path("runs")
+    log_root = Path(log_dir).expanduser() if log_dir is not None else default_dir
+    log_root.mkdir(parents=True, exist_ok=True)
+    return SummaryWriter(log_dir=str(log_root))
+
+def tensorboard_log_scalars(writer: SummaryWriter | None, step: int, scalars: dict[str, float]) -> None:
+    if writer is None:
+        return
+    for key, value in scalars.items():
+        writer.add_scalar(key, value, step)
+    writer.flush()
 
 
 def visualize_patch_similarity(
