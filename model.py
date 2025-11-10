@@ -21,6 +21,17 @@ from Dino_LoRA import inject_lora_qv_into_vit, LoRA_qkv
 from dinov3.models import build_model_for_eval  
 from torch.nn.parallel import DistributedDataParallel
 
+try:
+    from torch.distributed.fsdp import (
+        FullyShardedDataParallel as TorchFSDP,
+        FullStateDictConfig,
+        StateDictType,
+    )
+except (ImportError, ModuleNotFoundError):  # pragma: no cover - FSDP may be unavailable on CPU-only setups
+    TorchFSDP = None
+    FullStateDictConfig = None
+    StateDictType = None
+
 # NOTE: DualImageDINOv3 保留供分割任务调用；DINOv3SelfSupervised 则负责自监督 LoRA 训练。
 
 
@@ -347,6 +358,15 @@ class DINOv3SelfSupervised(nn.Module):
             return module.module
         return module
 
+    @staticmethod
+    def _module_state_dict(module: nn.Module) -> dict[str, Any]:
+        base_module = DINOv3SelfSupervised._unwrap_ddp(module)
+        if TorchFSDP is not None and isinstance(base_module, TorchFSDP) and FullStateDictConfig and StateDictType:
+            cfg = FullStateDictConfig(rank0_only=True, offload_to_cpu=True)
+            with TorchFSDP.state_dict_type(base_module, StateDictType.FULL_STATE_DICT, cfg):
+                return base_module.state_dict()
+        return base_module.state_dict()
+
     def _safe_sinkhorn(
         self,
         sinkhorn_fn,
@@ -520,10 +540,10 @@ class DINOv3SelfSupervised(nn.Module):
         return student_global, student_local
 
     def teacher_state_dict(self) -> dict[str, Any]:
-        return {k: v.state_dict() for k, v in self.teacher.items()}
+        return {k: self._module_state_dict(v) for k, v in self.teacher.items()}
 
     def student_state_dict(self) -> dict[str, Any]:
-        return {k: self._unwrap_ddp(v).state_dict() for k, v in self.student.items()}
+        return {k: self._module_state_dict(v) for k, v in self.student.items()}
 
 def test():
     torch.cuda.set_device(2)

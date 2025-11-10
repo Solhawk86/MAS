@@ -1,4 +1,5 @@
 from pathlib import Path
+from collections.abc import Mapping
 
 import numpy as np
 import torch
@@ -6,7 +7,11 @@ import torch.distributed as dist
 from torch.amp import GradScaler, autocast
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
-from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    MixedPrecision,
+)
+from torch.distributed.fsdp import ShardingStrategy
 
 
 from data.data import build_ssl_dataloader
@@ -23,11 +28,101 @@ from utils import (
     tensorboard_log_scalars,
 )
 
-# NOTE: 训练脚本遵循 DINOv3 自监督范式，仅更新 LoRA + 头部参数。四卡 3090 建议调整 batchsize.
+# NOTE: 训练脚本遵循 DINOv3 自监督范式，仅更新 LoRA + 头部参数。
 
 _ensure_torch_fsdp_compat()
 
 from dinov3.train.cosine_lr_scheduler import CosineScheduler  # noqa: E402
+
+
+DTYPE_MAP = {
+    "bf16": torch.bfloat16,
+    "bfloat16": torch.bfloat16,
+    "fp16": torch.float16,
+    "float16": torch.float16,
+    "fp32": torch.float32,
+    "float32": torch.float32,
+}
+
+
+def _resolve_dtype(name: str | torch.dtype | None, fallback: torch.dtype) -> torch.dtype:
+    if isinstance(name, torch.dtype):
+        return name
+    if not isinstance(name, str):
+        return fallback
+    return DTYPE_MAP.get(name.lower(), fallback)
+
+
+def _normalize_fsdp_cfg(cfg: Mapping[str, object] | None) -> dict[str, object]:
+    defaults = {
+        "enabled": True,
+        "mixed_precision": True,
+        "param_dtype": "bf16",
+        "reduce_dtype": "bf16",
+        "buffer_dtype": "bf16",
+        "sharding_strategy": "FULL_SHARD",
+        "sync_module_states": True,
+        "forward_prefetch": False,
+        "limit_all_gathers": True,
+    }
+    if cfg is None:
+        return defaults
+    normalized = dict(defaults)
+    normalized.update(dict(cfg))
+    return normalized
+
+
+def _maybe_wrap_with_fsdp(model: DINOv3SelfSupervised, cfg: dict, local_rank: int, device: torch.device) -> bool:
+    if not (dist.is_available() and dist.is_initialized()):
+        return False
+    fsdp_cfg = _normalize_fsdp_cfg(cfg.get("fsdp"))
+    if not fsdp_cfg.get("enabled", True):
+        return False
+
+    sharding_name = str(fsdp_cfg.get("sharding_strategy", "FULL_SHARD")).upper()
+    sharding = getattr(ShardingStrategy, sharding_name, ShardingStrategy.FULL_SHARD)
+    mixed_precision = None
+    if fsdp_cfg.get("mixed_precision", True):
+        mixed_precision = MixedPrecision(
+            param_dtype=_resolve_dtype(fsdp_cfg.get("param_dtype"), torch.bfloat16),
+            reduce_dtype=_resolve_dtype(fsdp_cfg.get("reduce_dtype"), torch.bfloat16),
+            buffer_dtype=_resolve_dtype(fsdp_cfg.get("buffer_dtype"), torch.bfloat16),
+        )
+
+    device_id = device.index if device.type == "cuda" else None
+    common_kwargs = dict(
+        sharding_strategy=sharding,
+        mixed_precision=mixed_precision,
+        forward_prefetch=bool(fsdp_cfg.get("forward_prefetch", False)),
+        limit_all_gathers=bool(fsdp_cfg.get("limit_all_gathers", True)),
+        use_orig_params=True,
+    )
+
+    def _wrap(module: torch.nn.Module, *, sync_states: bool) -> torch.nn.Module:
+        return FSDP(
+            module,
+            device_id=device_id,
+            sync_module_states=sync_states,
+            **common_kwargs,
+        )
+
+    student_keys = ["backbone", "dino_head", "ibot_head"]
+    for key in student_keys:
+        module = model.student[key]
+        if module is None:
+            continue
+        model.student[key] = _wrap(
+            module,
+            sync_states=bool(fsdp_cfg.get("sync_module_states", True)),
+        )
+
+    for key in list(model.teacher.keys()):
+        model.teacher[key] = _wrap(
+            model.teacher[key],
+            sync_states=False,
+        )
+
+    return True
 
 
 def train() -> None:
@@ -116,16 +211,12 @@ def train() -> None:
         lora_dropout=lora_dropout,
         ssl_cfg=ssl_cfg,
     ).to(device)
+    fsdp_wrapped = False
     if distributed:
-        ddp_kwargs = {
-            "device_ids": [local_rank],
-            "output_device": local_rank,
-            "broadcast_buffers": False,
-            "find_unused_parameters": False,
-        }
-        model.student["backbone"] = DDP(model.student["backbone"], **ddp_kwargs)
-        model.student["dino_head"] = DDP(model.student["dino_head"], **ddp_kwargs)
-        model.student["ibot_head"] = DDP(model.student["ibot_head"], **ddp_kwargs)
+        fsdp_wrapped = _maybe_wrap_with_fsdp(model, cfg, local_rank, device)
+    if fsdp_wrapped:
+        model.student.train()
+        model.teacher.eval()
     # loss = DINO + iBOT + KOLEO 
     # 暂未加入Gram
     criterion = SelfSupervisedLoss(
@@ -229,7 +320,12 @@ def train() -> None:
                 mask_center_buffer.append(mask_center.detach())
 
         if grad_clip > 0:
-            clip_grad_norm_(trainable_params, grad_clip)
+            if fsdp_wrapped:
+                for module in model.student.values():
+                    if isinstance(module, FSDP):
+                        FSDP.clip_grad_norm_(module, grad_clip)
+            else:
+                clip_grad_norm_(trainable_params, grad_clip)
 
         optimizer.step()
 
