@@ -5,3 +5,5 @@ checkpoints
 cosine_similarity/input
 cosine_similarity/output
 **/__pycache__/
+runs
+config_eval.yaml
