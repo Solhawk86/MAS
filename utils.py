@@ -6,13 +6,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from collections.abc import Mapping, MutableMapping
 from typing import Any, Union
-
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.distributed as dist
-import torch.nn as nn
-import torch.nn.functional as F
 import yaml
 from dinov3.distributed import enable as enable_distributed, is_enabled as dist_is_enabled
 from torch.utils.tensorboard import SummaryWriter
@@ -283,98 +279,3 @@ def tensorboard_log_scalars(writer: SummaryWriter | None, step: int, scalars: di
     for key, value in scalars.items():
         writer.add_scalar(key, value, step)
     writer.flush()
-
-
-def visualize_patch_similarity(
-    model: nn.Module,
-    img: torch.Tensor,
-    *,
-    patch_coords: tuple[int, int] | None = None,
-    layer: int | None = None,
-    cmap: str = "viridis",
-    normalize_mode: str = "global",
-    show: bool = True,
-):
-    """
-    将 ViT patch 特征之间的余弦相似度可视化为热力图。
-
-    参数:
-        model: 具备 `get_intermediate_layers` 接口的模型，或包含该接口的子模块（例如 `DualImageDINOv3`）。
-        img: 单张图像，shape 为 [3, H, W]，需预先按 ImageNet 均值 / 方差归一化。
-        patch_coords: 指定要展示的 patch 坐标 (i, j)，默认取特征图中心位置。
-        layer: 指定使用的层索引，默认取最后一层 (n=1)。
-        cmap: Matplotlib 中的 colormap 名称。
-        show: 是否直接使用 Matplotlib 展示热力图。
-
-    返回:
-        viz: 归一化到 [0, 1] 的 RGB 可视化张量，形状 [h, w, h, w, 3]。
-        cos: 归一化到 [0, 1] 的余弦相似度张量，形状 [h, w, h, w]。
-              若 normalize_mode="local"，代表按局部最小最大重新缩放。
-    """
-    if img.dim() != 3 or img.size(0) != 3:
-        raise ValueError("输入张量需为 [3, H, W] 的单张图像。")
-
-    # 推断模型所在设备，优先使用 model.device，其次读取参数设备
-    device = getattr(model, "device", None)
-    if device is None and hasattr(model, "backbone"):
-        device = getattr(model.backbone, "device", None)
-    if device is None:
-        try:
-            device = next(model.parameters()).device
-        except (StopIteration, AttributeError):
-            device = torch.device("cpu")
-    else:
-        device = torch.device(device)
-
-    img = img.unsqueeze(0).to(device)
-
-    # 适配 DualImageDINOv3 这类封装模型
-    target_module = model
-    if not hasattr(target_module, "get_intermediate_layers"):
-        target_module = getattr(model, "backbone", None)
-    if target_module is None or not hasattr(target_module, "get_intermediate_layers"):
-        raise AttributeError("传入的模型缺少 get_intermediate_layers 方法。")
-
-    layer_selector: int | list[int]
-    if layer is None:
-        layer_selector = 1
-    else:
-        layer_selector = [int(layer)]
-
-    with torch.no_grad():
-        feats = target_module.get_intermediate_layers(
-            img,
-            n=layer_selector,
-            reshape=True,
-        )[0]
-
-    _, dim, h, w = feats.shape
-    feats = feats.squeeze(0).movedim(-3, -1).flatten(0, 1)  # [hw, dim]
-    feats = F.normalize(feats, p=2, dim=-1)  # L2 归一化便于计算余弦相似度
-
-    cos = feats @ feats.transpose(0, 1)
-    cos = cos.unflatten(1, (h, w)).unflatten(0, (h, w))
-    cos = (cos + 1.0) / 2.0
-
-    mode = normalize_mode.lower()
-    if mode == "local":
-        cos_min = cos.amin()
-        cos_max = cos.amax()
-        denom = torch.clamp(cos_max - cos_min, min=1e-6)
-        cos = (cos - cos_min) / denom
-    elif mode not in {"global", ""}:
-        raise ValueError("normalize_mode 仅支持 'global' 或 'local'")
-
-    viz = plt.get_cmap(cmap)(cos.detach().cpu().numpy())[..., :3]
-
-    if patch_coords is None:
-        patch_coords = (h // 2, w // 2)
-    i, j = patch_coords
-    if not (0 <= i < h and 0 <= j < w):
-        raise ValueError(f"patch 坐标 {(i, j)} 超出特征网格范围 (h={h}, w={w})。")
-
-    if show:
-        plt.imshow(viz[i, j])
-        plt.title(f"Similarity of patch {(i, j)} to all other patches")
-
-    return viz, cos.cpu()

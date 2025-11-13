@@ -338,8 +338,8 @@ class DINOv3SelfSupervised(nn.Module):
     def _set_lora_trainable(backbone: nn.Module) -> None:
         for module in backbone.modules():
             if isinstance(module, LoRA_qkv):
-                for param in module.parameters():
-                    param.requires_grad = True
+                module.freeze_base_qkv()
+                module.set_lora_requires_grad(True)
 
     @staticmethod
     def _unwrap_ddp(module: nn.Module) -> nn.Module:
@@ -519,11 +519,21 @@ class DINOv3SelfSupervised(nn.Module):
         }
         return student_global, student_local
 
-    def teacher_state_dict(self) -> dict[str, Any]:
-        return {k: v.state_dict() for k, v in self.teacher.items()}
+    def teacher_backbone_state_dict(self) -> dict[str, Any]:
+        return self.teacher["backbone"].state_dict()
 
-    def student_state_dict(self) -> dict[str, Any]:
-        return {k: self._unwrap_ddp(v).state_dict() for k, v in self.student.items()}
+    def student_backbone_state_dict(self) -> dict[str, Any]:
+        return self._unwrap_ddp(self.student["backbone"]).state_dict()
+
+    def teacher_state_dict(self, *, include_heads: bool = True) -> dict[str, Any]:
+        if include_heads:
+            return {k: v.state_dict() for k, v in self.teacher.items()}
+        return {"backbone": self.teacher_backbone_state_dict()}
+
+    def student_state_dict(self, *, include_heads: bool = True) -> dict[str, Any]:
+        if include_heads:
+            return {k: self._unwrap_ddp(v).state_dict() for k, v in self.student.items()}
+        return {"backbone": self.student_backbone_state_dict()}
 
 def test():
     torch.cuda.set_device(2)

@@ -10,6 +10,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 
 from data.data import build_ssl_dataloader
+from log import init_training_logger
 from loss import SelfSupervisedLoss
 from model import DINOv3SelfSupervised
 from utils import (
@@ -18,9 +19,7 @@ from utils import (
     _ensure_dir,
     _ensure_torch_fsdp_compat,
     _setup_device_and_distributed,
-    create_tensorboard_writer,
     load_config,
-    tensorboard_log_scalars,
 )
 
 # NOTE: 训练脚本遵循 DINOv3 自监督范式，仅更新 LoRA + 头部参数。四卡 3090 建议调整 batchsize.
@@ -46,11 +45,20 @@ def train() -> None:
     log_interval = int(train_cfg.get("log_interval", 50))
     grad_clip = float(train_cfg.get("grad_clip_norm", 0.0))
     checkpoint_interval = int(train_cfg.get("checkpoint_interval", 0))
-    checkpoint_dir = train_cfg.get("checkpoint_dir", "checkpoints")
     grad_accum_steps = max(1, int(train_cfg.get("grad_accum_steps", 1)))
     tensorboard_enabled = bool(train_cfg.get("tensorboard_enabled", False))
-    tensorboard_log_dir = train_cfg.get("tensorboard_log_dir")
-    tb_writer = create_tensorboard_writer(tensorboard_log_dir, rank, tensorboard_enabled)
+    log_trainable_params = bool(train_cfg.get("log_trainable_params", False))
+
+    training_logger = init_training_logger(
+        rank=rank,
+        distributed=distributed,
+        tensorboard_enabled=tensorboard_enabled,
+        tensorboard_subdir=train_cfg.get("tensorboard_log_dir"),
+        checkpoint_subdir=train_cfg.get("checkpoint_dir"),
+    )
+    checkpoint_dir = training_logger.checkpoint_dir
+    if is_main_process:
+        training_logger.log_config(cfg)
 
     #2、配置 LoRA 微调参数，仅训练 LoRA 层和head。
     lora_layers = train_cfg.get("lora_layers", 4)
@@ -126,6 +134,10 @@ def train() -> None:
         model.student["backbone"] = DDP(model.student["backbone"], **ddp_kwargs)
         model.student["dino_head"] = DDP(model.student["dino_head"], **ddp_kwargs)
         model.student["ibot_head"] = DDP(model.student["ibot_head"], **ddp_kwargs)
+
+    if log_trainable_params and is_main_process:
+        training_logger.log_debug("参数梯度状态 (初始化后)")
+        training_logger.log_module_grad_status(model, label="model")
     # loss = DINO + iBOT + KOLEO 
     # 暂未加入Gram
     criterion = SelfSupervisedLoss(
@@ -280,44 +292,40 @@ def train() -> None:
                 if metric_name in running_metrics:
                     smoothed_scalars[f"loss/{metric_name}"] = running_metrics[metric_name]
 
-            tensorboard_log_scalars(tb_writer, update_step, raw_loss_scalars)
-            tensorboard_log_scalars(tb_writer, update_step, smoothed_scalars)
+            training_logger.log_scalars(update_step, raw_loss_scalars, smoothed_scalars)
 
             if update_step % log_interval == 0 or update_step == 1:
-                metrics_str = " ".join(f"{k}:{v:.4f}" for k, v in sorted(running_metrics.items()))
-                print(
-                    f"[Step {update_step}/{max_steps}] loss={loss_val:.4f} lr={lr_this_step:.6e} "
-                    f"temp={teacher_temp:.4f} mom={momentum:.5f} {metrics_str}"
+                training_logger.log_progress(
+                    step=update_step,
+                    max_steps=max_steps,
+                    loss_val=loss_val,
+                    lr_val=lr_this_step,
+                    teacher_temp=teacher_temp,
+                    momentum=momentum,
+                    running_metrics=running_metrics,
                 )
 
             if checkpoint_interval > 0 and update_step % checkpoint_interval == 0:
-                ckpt_path = Path(checkpoint_dir) / f"step_{update_step:06d}.pth"
-                torch.save(
-                    {
-                        "step": update_step,
-                        "teacher": model.teacher_state_dict(),
-                        "student": model.student_state_dict(),
-                        "optimizer": optimizer.state_dict(),
-                    },
-                    ckpt_path,
-                )
+                teacher_ckpt = checkpoint_dir / f"teacher_backbone_step_{update_step:06d}.pth"
+                student_ckpt = checkpoint_dir / f"student_backbone_step_{update_step:06d}.pth"
+                optimizer_ckpt = checkpoint_dir / f"optimizer_state_step_{update_step:06d}.pth"
+                torch.save(model.teacher_backbone_state_dict(), teacher_ckpt)
+                torch.save(model.student_backbone_state_dict(), student_ckpt)
+                torch.save({"step": update_step, "optimizer": optimizer.state_dict()}, optimizer_ckpt)
 
     if distributed:
         dist.barrier()
 
     if is_main_process:
-        final_ckpt = Path(checkpoint_dir) / "final_teacher.pth"
-        torch.save(
-            {
-                "teacher": model.teacher_state_dict(),
-                "student": model.student_state_dict(),
-            },
-            final_ckpt,
+        teacher_final = checkpoint_dir / "teacher_backbone_final.pth"
+        student_final = checkpoint_dir / "student_backbone_final.pth"
+        torch.save(model.teacher_backbone_state_dict(), teacher_final)
+        torch.save(model.student_backbone_state_dict(), student_final)
+        training_logger.log_message(
+            f"训练结束，教师 backbone 保存至 {teacher_final}，学生 backbone 保存至 {student_final}"
         )
-        print(f"训练结束，教师权重已保存至 {final_ckpt}")
 
-    if tb_writer is not None:
-        tb_writer.close()
+    training_logger.close()
 
 
 if __name__ == "__main__":

@@ -7,3 +7,13 @@ cosine_similarity/output
 **/__pycache__/
 runs
 config_eval.yaml
+weights
+test_lora.py
+student1.txt
+student3.txt
+cosine_outputs
+extract_backbone.py
+inspect_block_params.py
+pretrained.txt
+MAS_MarineFish_ElectricRay_Com_2870.jpg
+config_eval.yaml

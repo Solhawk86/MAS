@@ -46,6 +46,16 @@ class LoRA_qkv(nn.Module):
 
         self.out_per_part = out_per_part
 
+    def set_lora_requires_grad(self, requires_grad: bool = True) -> None:
+        modules = (self.lora_a_q, self.lora_b_q, self.lora_a_v, self.lora_b_v)
+        for module in modules:
+            for param in module.parameters():
+                param.requires_grad = requires_grad
+
+    def freeze_base_qkv(self) -> None:
+        for param in self.qkv.parameters():
+            param.requires_grad = False
+
     @property
     def weight(self):
         return self.qkv.weight
