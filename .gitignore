@@ -5,6 +5,7 @@ checkpoints
 cosine_similarity/input
 cosine_similarity/output
 **/__pycache__/
+__pycache__/
 runs
 config_eval.yaml
 weights
@@ -17,3 +18,4 @@ inspect_block_params.py
 pretrained.txt
 MAS_MarineFish_ElectricRay_Com_2870.jpg
 config_eval.yaml
+.gitignore
