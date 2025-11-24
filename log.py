@@ -4,7 +4,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import torch.distributed as dist
 import torch.nn as nn
@@ -114,6 +114,7 @@ def init_training_logger(
     tensorboard_subdir: str | None,
     checkpoint_subdir: str | None,
     weights_root: str | Path | None = None,
+    local_weights_root: str | Path | None = None,
 ) -> TrainingLogger:
     workspace = _build_workspace(
         rank=rank,
@@ -121,6 +122,7 @@ def init_training_logger(
         tensorboard_subdir=tensorboard_subdir,
         checkpoint_subdir=checkpoint_subdir,
         weights_root=weights_root,
+        local_weights_root=local_weights_root,
     )
     logger = _configure_file_logger(workspace.log_file) if rank == 0 else None
     tb_writer = create_tensorboard_writer(workspace.tensorboard_dir, rank, tensorboard_enabled)
@@ -134,31 +136,38 @@ def _build_workspace(
     tensorboard_subdir: str | None,
     checkpoint_subdir: str | None,
     weights_root: str | Path | None,
+    local_weights_root: str | Path | None,
 ) -> RunWorkspace:
-    base_dir = Path(weights_root) if weights_root is not None else Path(__file__).resolve().parent / "weights"
-    base_dir = base_dir.resolve()
-    base_dir.mkdir(parents=True, exist_ok=True)
+    default_base = Path(__file__).resolve().parent / "weights"
+    remote_base = _resolve_workspace_root(weights_root, default_base)
+    local_base = _resolve_workspace_root(local_weights_root, default_base)
+    remote_base.mkdir(parents=True, exist_ok=True)
+    local_base.mkdir(parents=True, exist_ok=True)
 
-    run_dir_str = ""
+    run_dir_name = ""
     if rank == 0:
-        run_dir = _next_run_dir(base_dir)
-        run_dir.mkdir(parents=True, exist_ok=True)
-        run_dir_str = str(run_dir)
+        run_dir_name = _next_run_name(remote_base, [local_base])
+        (remote_base / run_dir_name).mkdir(parents=True, exist_ok=True)
+        (local_base / run_dir_name).mkdir(parents=True, exist_ok=True)
 
     if _should_broadcast(distributed):
-        buffer = [run_dir_str]
+        buffer = [run_dir_name]
         dist.broadcast_object_list(buffer, src=0)
-        run_dir_str = buffer[0]
+        run_dir_name = buffer[0]
 
-    if not run_dir_str:
+    if not run_dir_name:
         raise RuntimeError("无法确定训练运行目录")
 
-    run_dir = Path(run_dir_str)
+    run_dir = remote_base / run_dir_name
+    local_run_dir = local_base / run_dir_name
     run_dir.mkdir(parents=True, exist_ok=True)
+    local_run_dir.mkdir(parents=True, exist_ok=True)
 
     checkpoints_dir = _subdir_path(run_dir, checkpoint_subdir, "checkpoints")
-    tensorboard_dir = _subdir_path(run_dir, tensorboard_subdir, "tensorboard")
-    log_file = run_dir / "train.log"
+    tensorboard_dir = _subdir_path(local_run_dir, tensorboard_subdir, "tensorboard")
+    if rank == 0:
+        _expose_tensorboard_run(run_dir, tensorboard_dir)
+    log_file = local_run_dir / "train.log"
 
     return RunWorkspace(
         run_dir=run_dir,
@@ -168,14 +177,33 @@ def _build_workspace(
     )
 
 
-def _next_run_dir(base_dir: Path) -> Path:
-    date_str = datetime.now().strftime("%Y%m%d")
-    candidate = base_dir / date_str
-    suffix = 1
-    while candidate.exists():
-        candidate = base_dir / f"{date_str}_{suffix:02d}"
-        suffix += 1
+def _resolve_workspace_root(path_like: str | Path | None, default: Path) -> Path:
+    if path_like is None:
+        return default
+    path_str = str(path_like).strip()
+    if not path_str:
+        return default
+    candidate = Path(path_str).expanduser()
+    if not candidate.is_absolute():
+        candidate = default.parent / candidate
     return candidate
+
+
+def _next_run_name(base_dir: Path, mirror_bases: Sequence[Path]) -> str:
+    date_str = datetime.now().strftime("%Y%m%d")
+    suffix = 0
+
+    def _exists_any(name: str) -> bool:
+        for candidate_base in (base_dir, *mirror_bases):
+            if (candidate_base / name).exists():
+                return True
+        return False
+
+    while True:
+        name = date_str if suffix == 0 else f"{date_str}_{suffix:02d}"
+        if not _exists_any(name):
+            return name
+        suffix += 1
 
 
 def _subdir_path(root: Path, requested: str | None, default_name: str) -> Path:
@@ -192,6 +220,33 @@ def _subdir_path(root: Path, requested: str | None, default_name: str) -> Path:
     target = root / relative_path
     target.mkdir(parents=True, exist_ok=True)
     return target
+
+
+def _expose_tensorboard_run(run_dir: Path, tensorboard_dir: Path) -> None:
+    """Symlink the current run's TensorBoard dir under the project-level `runs/` folder."""
+    project_root = Path(__file__).resolve().parent
+    runs_root = project_root / "runs"
+    try:
+        runs_root.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+
+    link_target = tensorboard_dir.resolve()
+    link_path = runs_root / run_dir.name
+
+    if link_path.exists() or link_path.is_symlink():
+        try:
+            if link_path.resolve() == link_target:
+                return
+        except OSError:
+            return
+        return
+
+    try:
+        link_path.symlink_to(link_target, target_is_directory=True)
+    except OSError:
+        # Some filesystems do not allow symlinks; fail silently so training can continue.
+        return
 
 
 def _configure_file_logger(log_file: Path) -> logging.Logger:

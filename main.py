@@ -32,6 +32,9 @@ from dinov3.train.cosine_lr_scheduler import CosineScheduler  # noqa: E402
 def train() -> None:
     cfg_path = Path(__file__).resolve().parent / "config_eval.yaml"
     cfg = load_config(cfg_path)
+    workspace_cfg = cfg.get("weights", {}) if isinstance(cfg.get("weights"), dict) else {}
+    weights_root = workspace_cfg.get("storage_dir") or None
+    local_weights_root = workspace_cfg.get("local_dir") or None
     device, rank, world_size, local_rank, distributed = _setup_device_and_distributed()
     is_main_process = rank == 0
 
@@ -55,6 +58,8 @@ def train() -> None:
         tensorboard_enabled=tensorboard_enabled,
         tensorboard_subdir=train_cfg.get("tensorboard_log_dir"),
         checkpoint_subdir=train_cfg.get("checkpoint_dir"),
+        weights_root=weights_root,
+        local_weights_root=local_weights_root,
     )
     checkpoint_dir = training_logger.checkpoint_dir
     if is_main_process:

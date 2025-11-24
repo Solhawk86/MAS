@@ -19,3 +19,11 @@ pretrained.txt
 MAS_MarineFish_ElectricRay_Com_2870.jpg
 config_eval.yaml
 .gitignore
+feature_cache
+seg_eval_runs
+m2f_feature
+hf_mask2former_runs
+caliou.py
+config_m2f_segmentation.yaml
+coco_masks_to_png.py
+plot_miou_curve.py
