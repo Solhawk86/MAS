@@ -10,7 +10,14 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import sys
 
+from pathlib import Path
+
 sys.path.append("/home/yangyan/hong/dinov3")
+# 确保可以以包形式导入 MAS.*
+_CWD = Path(__file__).resolve().parent
+_PROJECT_ROOT = _CWD.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 import numpy as np
 import torch
@@ -24,6 +31,8 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 
 from MAS.data.data import FeatureCacheDataset, SegmentationFolderDataset, build_basic_dataloader  # type: ignore
+from MAS.feature_cache import cache_features_for_dataset
+from MAS.model.backbone_utils import build_backbone
 from dinov3.eval.segmentation.config import (
     DecoderConfig,
     EvalConfig as SlidingEvalConfig,
@@ -41,10 +50,11 @@ from dinov3.eval.segmentation.models import build_segmentation_decoder
 from dinov3.eval.segmentation.schedulers import build_scheduler
 from dinov3.eval.segmentation.transforms import make_segmentation_eval_transforms, make_segmentation_train_transforms
 from dinov3.logging import MetricLogger, SmoothedValue
-from dinov3.models import build_model_for_eval
 
-from Dino_LoRA import inject_lora_qv_into_vit
-from utils import dict_to_namespace, load_config, prepare_dinov3_cfg
+from utils import load_config,_tensor_to_uint8_image
+import warnings
+warnings.filterwarnings("ignore", message=".*weights_only=False.*")
+
 
 logger = logging.getLogger("mas.seg_eval")
 
@@ -112,67 +122,6 @@ class SegmentationEvalConfig:
     model_dtype: ModelDtype = ModelDtype.FLOAT32
     ignore_index: int = 255
     save_best_head: bool = True
-
-
-def cache_is_complete(cache_dir: Path, expected_len: int) -> bool:
-    if not cache_dir.exists():
-        return False
-    return len(list(cache_dir.glob("*.pt"))) >= expected_len
-
-
-def cache_split_features(split, dataset, seg_cfg, feature_extractor, device, batch_size, num_workers):
-    cache_dir = Path(seg_cfg.feature_cache_dir).expanduser() / split
-    if is_main_process():
-        cache_dir.mkdir(parents=True, exist_ok=True)
-    synchronize()
-    if seg_cfg.reuse_cached_features and cache_is_complete(cache_dir, len(dataset)):
-        if is_main_process():
-            logger.info("复用缓存 %s（%d 样本）", cache_dir, len(dataset))
-        synchronize()
-        return cache_dir
-
-    loader = build_basic_dataloader(
-        dataset,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        shuffle=False,
-        pin_memory=True,
-        distributed=is_distributed(),
-    )
-    feature_extractor.eval()
-    for images, masks, indices in loader:
-        images_cpu = images
-        images = images.to(device, non_blocking=True)
-        with torch.no_grad():
-            feats = feature_extractor(images)
-        if isinstance(feats, tuple):
-            feats = list(feats)
-        feat_list = [feat.cpu() for feat in feats] if isinstance(feats, list) else [feats.cpu()]
-        masks_cpu = masks.cpu()
-        for b_idx, sample_idx in enumerate(indices.tolist()):
-            sample = {
-                "features": [feat[b_idx].contiguous() for feat in feat_list],
-                "mask": (masks_cpu[b_idx] > 0).to(torch.long),
-            }
-            if isinstance(images_cpu, torch.Tensor):
-                sample["image"] = images_cpu[b_idx].clone()
-            torch.save(sample, cache_dir / f"{sample_idx:08d}.pt")
-    synchronize()
-    return cache_dir
-
-
-def _tensor_to_uint8_image(image_tensor: Optional[torch.Tensor], mean_tensor: torch.Tensor, std_tensor: torch.Tensor):
-    if image_tensor is None:
-        return None
-    image = image_tensor.detach().clone()
-    if image.ndim == 4:
-        image = image.squeeze(0)
-    mean_broadcast = mean_tensor.to(image.dtype)
-    std_broadcast = std_tensor.to(image.dtype)
-    image = image * std_broadcast + mean_broadcast
-    image = image.clamp(0, 255).to(torch.uint8)
-    image = image.permute(1, 2, 0).cpu().numpy()
-    return image
 
 
 def _prepare_mask_for_display(mask_tensor: torch.Tensor, target_hw: Optional[tuple[int, int]] = None):
@@ -295,40 +244,6 @@ def load_segmentation_eval_config(base_cfg: Dict[str, Any], seg_cfg_path: Option
     structured = OmegaConf.structured(SegmentationEvalConfig)
     merged = OmegaConf.merge(structured, raw_cfg)
     return OmegaConf.to_object(merged)  # type: ignore[return-value]
-
-
-def build_backbone(cfg: Dict[str, Any], device: torch.device) -> torch.nn.Module:
-    processed = prepare_dinov3_cfg(cfg)
-    ns_cfg = dict_to_namespace(processed)
-    pretrained = processed.get("pretrained_weights")
-    backbone = build_model_for_eval(config=ns_cfg, pretrained_weights=pretrained)
-    backbone.to(device)
-    backbone.eval()
-    lora_layers = cfg.get("train", {}).get("lora_layers")
-    if lora_layers not in (None, 0, []):
-        inject_lora_qv_into_vit(
-            backbone,
-            layers=lora_layers,
-            rank=int(cfg.get("train", {}).get("lora_rank", 8)),
-            alpha=float(cfg.get("train", {}).get("lora_alpha", 16.0)),
-            dropout=float(cfg.get("train", {}).get("lora_dropout", 0.0)),
-        )
-    finetuned_path = cfg.get("finetuned_weights")
-    if finetuned_path:
-        state = torch.load(Path(finetuned_path).expanduser(), map_location="cpu")
-        backbone_state = _extract_backbone_state(state)
-        backbone.load_state_dict(backbone_state, strict=False)
-    backbone.requires_grad_(False)
-    return backbone
-
-
-def _extract_backbone_state(state: Dict[str, Any]) -> Dict[str, Any]:
-    if "student" in state and isinstance(state["student"], dict) and "backbone" in state["student"]:
-        return state["student"]["backbone"]
-    if "backbone" in state and isinstance(state["backbone"], dict):
-        return state["backbone"]
-    return state
-
 
 
 """Train linear head across epochs with periodic evaluation."""
@@ -634,23 +549,34 @@ def main():
         ),
     )
 
-    cache_train = cache_split_features(
-        "train",
-        train_dataset,
-        seg_cfg,
-        feature_extractor,
-        device,
-        seg_cfg.batch_size,
-        seg_cfg.num_workers,
+    log_fn = (lambda msg: logger.info(msg)) if is_main_process() else None
+    cache_train = cache_features_for_dataset(
+        split_name="train",
+        dataset=train_dataset,
+        cache_root=seg_cfg.feature_cache_dir,
+        feature_extractor=feature_extractor,
+        feature_order=None,
+        device=device,
+        batch_size=seg_cfg.batch_size,
+        num_workers=seg_cfg.num_workers,
+        reuse_existing=seg_cfg.reuse_cached_features,
+        store_images=True,
+        binarize_masks=True,
+        log_fn=log_fn,
     )
-    cache_val = cache_split_features(
-        "val",
-        val_dataset,
-        seg_cfg,
-        feature_extractor,
-        device,
-        seg_cfg.val_batch_size,
-        max(1, seg_cfg.num_workers // 2),
+    cache_val = cache_features_for_dataset(
+        split_name="val",
+        dataset=val_dataset,
+        cache_root=seg_cfg.feature_cache_dir,
+        feature_extractor=feature_extractor,
+        feature_order=None,
+        device=device,
+        batch_size=seg_cfg.val_batch_size,
+        num_workers=max(1, seg_cfg.num_workers // 2),
+        reuse_existing=seg_cfg.reuse_cached_features,
+        store_images=True,
+        binarize_masks=True,
+        log_fn=log_fn,
     )
 
     del segmentation_model
