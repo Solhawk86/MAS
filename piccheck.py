@@ -230,5 +230,6 @@ def binarize_masks(
     print(f"共处理 {processed} 张图片，输出路径: {target_dir}")
 
 if __name__ == "__main__":
-    # binarize_masks("/mnt/mydata/hong/RMAS/test/label", output_dir="/mnt/mydata/hong/RMAS/test/binary_label")
-    value_check("/mnt/mydata/hong/RMAS/test/binary_label")
+    # binarize_masks("/mnt/mydata/hong/MAS3K/test/Mask", output_dir="/mnt/mydata/hong/MAS3K/test/binary_label")
+    value_check("/mnt/mydata/hong/MAS3K/test/binary_label")
+    # inspect_mask("/mnt/mydata/hong/RMAS_small/test/binary_label/49.png")
