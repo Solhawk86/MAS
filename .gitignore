@@ -27,3 +27,6 @@ caliou.py
 config_m2f_segmentation.yaml
 coco_masks_to_png.py
 plot_miou_curve.py
+piccheck.py
+compute_flops.py
+test_m2f_smoke.py

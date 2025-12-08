@@ -34,6 +34,10 @@ class TrainingLogger:
     def checkpoint_dir(self) -> Path:
         return self.workspace.checkpoints_dir
 
+    @property
+    def run_dir(self) -> Path:
+        return self.workspace.run_dir
+
     def log_config(self, cfg: dict[str, Any]) -> None:
         """将完整配置写入日志文件，便于复现。"""
         if self._logger is None:
@@ -140,15 +144,12 @@ def _build_workspace(
 ) -> RunWorkspace:
     default_base = Path(__file__).resolve().parent / "weights"
     remote_base = _resolve_workspace_root(weights_root, default_base)
-    local_base = _resolve_workspace_root(local_weights_root, default_base)
     remote_base.mkdir(parents=True, exist_ok=True)
-    local_base.mkdir(parents=True, exist_ok=True)
 
     run_dir_name = ""
     if rank == 0:
-        run_dir_name = _next_run_name(remote_base, [local_base])
+        run_dir_name = _next_run_name(remote_base, [])
         (remote_base / run_dir_name).mkdir(parents=True, exist_ok=True)
-        (local_base / run_dir_name).mkdir(parents=True, exist_ok=True)
 
     if _should_broadcast(distributed):
         buffer = [run_dir_name]
@@ -159,15 +160,15 @@ def _build_workspace(
         raise RuntimeError("无法确定训练运行目录")
 
     run_dir = remote_base / run_dir_name
-    local_run_dir = local_base / run_dir_name
+    local_run_dir = run_dir
     run_dir.mkdir(parents=True, exist_ok=True)
     local_run_dir.mkdir(parents=True, exist_ok=True)
 
     checkpoints_dir = _subdir_path(run_dir, checkpoint_subdir, "checkpoints")
-    tensorboard_dir = _subdir_path(local_run_dir, tensorboard_subdir, "tensorboard")
+    tensorboard_dir = _subdir_path(run_dir, tensorboard_subdir, "tensorboard")
     if rank == 0:
         _expose_tensorboard_run(run_dir, tensorboard_dir)
-    log_file = local_run_dir / "train.log"
+    log_file = run_dir / "train.log"
 
     return RunWorkspace(
         run_dir=run_dir,

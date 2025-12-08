@@ -12,7 +12,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from data.data import build_ssl_dataloader
 from log import init_training_logger
 from loss import SelfSupervisedLoss
-from model import DINOv3SelfSupervised
+from MAS.model.model import DINOv3SelfSupervised
 from utils import (
     _build_teacher_temp_schedule,
     _distributed_mean,
@@ -34,7 +34,6 @@ def train() -> None:
     cfg = load_config(cfg_path)
     workspace_cfg = cfg.get("weights", {}) if isinstance(cfg.get("weights"), dict) else {}
     weights_root = workspace_cfg.get("storage_dir") or None
-    local_weights_root = workspace_cfg.get("local_dir") or None
     device, rank, world_size, local_rank, distributed = _setup_device_and_distributed()
     is_main_process = rank == 0
 
@@ -59,7 +58,7 @@ def train() -> None:
         tensorboard_subdir=train_cfg.get("tensorboard_log_dir"),
         checkpoint_subdir=train_cfg.get("checkpoint_dir"),
         weights_root=weights_root,
-        local_weights_root=local_weights_root,
+        local_weights_root=None,
     )
     checkpoint_dir = training_logger.checkpoint_dir
     if is_main_process:
