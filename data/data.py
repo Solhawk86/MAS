@@ -2,7 +2,7 @@ import random
 from collections import OrderedDict
 from functools import partial
 from pathlib import Path
-from typing import Optional, Callable, Any
+from typing import Optional, Callable, Any, Iterable, Dict
 
 import numpy as np
 import torch
@@ -16,6 +16,10 @@ import torchvision.transforms.functional as TF
 from dinov3.data.augmentations import DataAugmentationDINO
 from dinov3.data.collate import collate_data_and_cast
 from dinov3.data.masking import MaskingGenerator
+from dinov3.eval.segmentation.transforms import (
+    make_segmentation_eval_transforms,
+    make_segmentation_train_transforms,
+)
 
 # NOTE: 图像+mask 数据集，用于下游分割任务；新增自监督数据pipeline。
 
@@ -56,6 +60,229 @@ def make_enhance_transform(resize_size: int | list[int] = 518) -> Callable:
         v2.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
     ]
     return v2.Compose(augmentations)
+
+
+class SegmentationFolderDataset(TorchDataset):
+    """图像/掩码文件夹对，按文件名匹配。"""
+
+    def __init__(self, image_dir: Path, mask_dir: Path, transforms):
+        self.image_dir = image_dir
+        self.mask_dir = mask_dir
+        self.transforms = transforms
+        image_map = self._scan(image_dir, {"jpg", "jpeg", "png"})
+        mask_map = self._scan(mask_dir, {"png", "jpg", "jpeg"})
+        common = sorted(image_map.keys() & mask_map.keys())
+        if not common:
+            raise ValueError(f"在 {image_dir} 与 {mask_dir} 中找不到匹配文件")
+        self.image_paths = [image_map[k] for k in common]
+        self.mask_paths = [mask_map[k] for k in common]
+
+    @staticmethod
+    def _scan(directory: Path, extensions: Iterable[str]) -> Dict[str, Path]:
+        result: Dict[str, Path] = {}
+        for path in directory.iterdir():
+            if path.is_file() and path.suffix.lower().lstrip(".") in extensions:
+                result[path.stem] = path
+        return result
+
+    def __len__(self) -> int:
+        return len(self.image_paths)
+
+    def __getitem__(self, idx: int):
+        image = Image.open(self.image_paths[idx]).convert("RGB")
+        mask = Image.open(self.mask_paths[idx])
+        orig_size = torch.tensor((mask.height, mask.width), dtype=torch.long)
+        file_name = self.image_paths[idx].stem
+        image, mask = self.transforms(image, mask)
+        mask_tensor = self._ensure_long_mask(mask)
+        mask_tensor = normalize_binary_mask(mask_tensor)
+        return self._ensure_float_tensor(image), mask_tensor, idx, orig_size, file_name
+
+    @staticmethod
+    def _ensure_float_tensor(image: Any) -> torch.Tensor:
+        if isinstance(image, list):
+            image = image[0]
+        if not isinstance(image, torch.Tensor):
+            image = torch.as_tensor(image)
+        return image.float()
+
+    @staticmethod
+    def _ensure_long_mask(mask: Any) -> torch.Tensor:
+        tensor = torch.as_tensor(mask) if not isinstance(mask, torch.Tensor) else mask
+        if tensor.ndim == 3 and tensor.shape[0] == 1:
+            tensor = tensor.squeeze(0)
+        return tensor.long()
+
+def normalize_binary_mask(mask: torch.Tensor) -> torch.Tensor:
+    """
+    将二值 PNG 掩码（0/255 等）归一化为 0/1，避免 loss 计算时遗漏类别。
+    多类别掩码保持原状。
+    """
+    if not torch.is_tensor(mask):
+        mask = torch.as_tensor(mask)
+    mask = mask.long()
+    if mask.numel() == 0:
+        return mask
+    unique_vals = torch.unique(mask)
+    if unique_vals.numel() <= 2:
+        non_negative = bool(torch.all(unique_vals >= 0))
+        has_foreground = bool(torch.any(unique_vals > 0))
+        if non_negative and has_foreground:
+            return (mask > 0).long()
+    return mask
+
+
+class FeatureCacheDataset(TorchDataset):
+    """读取离线缓存的特征/mask 对。"""
+
+    def __init__(self, cache_dir: Path, *, binarize_masks: bool = False):
+        self.files = sorted(cache_dir.glob("*.pt"))
+        if not self.files:
+            raise ValueError(f"缓存目录 {cache_dir} 为空，请先生成特征")
+        self.binarize_masks = binarize_masks
+
+    def __len__(self) -> int:
+        return len(self.files)
+
+    def __getitem__(self, idx: int):
+        sample = torch.load(self.files[idx], map_location="cpu", weights_only=True)
+        features = sample["features"]
+        mask = sample["mask"]
+        if self.binarize_masks:
+            mask = normalize_binary_mask(mask)
+        return features, mask
+
+
+def _resolve_dataset_paths(dataset_cfg: dict) -> tuple[Path, Path, Path, Path]:
+    return (
+        Path(dataset_cfg["train_images"]).expanduser(),
+        Path(dataset_cfg["train_masks"]).expanduser(),
+        Path(dataset_cfg["val_images"]).expanduser(),
+        Path(dataset_cfg["val_masks"]).expanduser(),
+    )
+
+
+def _build_dataloader(
+    dataset,
+    *,
+    batch_size: int,
+    num_workers: int,
+    shuffle: bool,
+    pin_memory: bool,
+    distributed: bool,
+):
+    sampler = DistributedSampler(dataset, shuffle=shuffle, drop_last=False) if distributed else None
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        shuffle=(sampler is None and shuffle),
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=False,
+    )
+
+
+def build_basic_dataloader(
+    dataset,
+    *,
+    batch_size: int,
+    num_workers: int,
+    shuffle: bool,
+    pin_memory: bool,
+    distributed: bool = False,
+) -> DataLoader:
+    return _build_dataloader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        shuffle=shuffle,
+        pin_memory=pin_memory,
+        distributed=distributed,
+    )
+
+
+def build_segmentation_datasets_from_cfg(dataset_cfg: dict):
+    transforms_cfg = dataset_cfg.get("transforms", {})
+    mean = transforms_cfg.get("mean", (0.485, 0.456, 0.406))
+    std = transforms_cfg.get("std", (0.229, 0.224, 0.225))
+    train_tf_cfg = transforms_cfg.get("train", {})
+    eval_tf_cfg = transforms_cfg.get("eval", {})
+
+    train_transforms = make_segmentation_train_transforms(
+        img_size=train_tf_cfg.get("img_size", 256),
+        random_img_size_ratio_range=train_tf_cfg.get("random_img_size_ratio_range", [0.5, 2.0]),
+        crop_size=train_tf_cfg.get("crop_size", [256, 256]),
+        flip_prob=train_tf_cfg.get("flip_prob", 0.5),
+        mean=mean,
+        std=std,
+    )
+    eval_img_size = eval_tf_cfg.get("img_size", 256)
+    if isinstance(eval_img_size, int):
+        eval_img_size = [eval_img_size, eval_img_size]
+    eval_transforms = make_segmentation_eval_transforms(
+        img_size=eval_img_size,
+        inference_mode=eval_tf_cfg.get("inference_mode", "slide"),
+        use_tta=eval_tf_cfg.get("use_tta", False),
+        tta_ratios=eval_tf_cfg.get("tta_ratios", [1.0]),
+        mean=mean,
+        std=std,
+    )
+
+    train_images, train_masks, val_images, val_masks = _resolve_dataset_paths(dataset_cfg)
+    train_dataset = SegmentationFolderDataset(train_images, train_masks, train_transforms)
+    val_dataset = SegmentationFolderDataset(val_images, val_masks, eval_transforms)
+    return train_dataset, val_dataset
+
+
+def build_segmentation_image_dataloaders_from_cfg(
+    dataset_cfg: dict,
+    training_cfg: dict,
+    device_type: str,
+    *,
+    distributed: bool = False,
+):
+    train_dataset, val_dataset = build_segmentation_datasets_from_cfg(dataset_cfg)
+
+    pin_memory = device_type == "cuda"
+    train_loader = _build_dataloader(
+        train_dataset,
+        batch_size=training_cfg.get("batch_size", 2),
+        num_workers=training_cfg.get("num_workers", 4),
+        shuffle=training_cfg.get("shuffle_train", True),
+        pin_memory=pin_memory,
+        distributed=distributed,
+    )
+    val_loader = _build_dataloader(
+        val_dataset,
+        batch_size=training_cfg.get("val_batch_size", 1),
+        num_workers=max(1, training_cfg.get("num_workers", 4) // 2),
+        shuffle=False,
+        pin_memory=pin_memory,
+        distributed=distributed,
+    )
+    return train_loader, val_loader
+
+
+def build_cached_feature_dataloader(
+    cache_dir: Path,
+    *,
+    batch_size: int,
+    num_workers: int,
+    shuffle: bool,
+    pin_memory: bool,
+    distributed: bool = False,
+    binarize_masks: bool = False,
+):
+    dataset = FeatureCacheDataset(cache_dir, binarize_masks=binarize_masks)
+    return _build_dataloader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        shuffle=shuffle,
+        pin_memory=pin_memory,
+        distributed=distributed,
+    )
 
 class Dataset(TorchDataset):
     """
