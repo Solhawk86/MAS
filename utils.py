@@ -5,7 +5,7 @@ from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 from collections.abc import Mapping, MutableMapping
-from typing import Any, Union
+from typing import Any, Union, Optional
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -279,3 +279,16 @@ def tensorboard_log_scalars(writer: SummaryWriter | None, step: int, scalars: di
     for key, value in scalars.items():
         writer.add_scalar(key, value, step)
     writer.flush()
+
+def _tensor_to_uint8_image(image_tensor: Optional[torch.Tensor], mean_tensor: torch.Tensor, std_tensor: torch.Tensor):
+    if image_tensor is None:
+        return None
+    image = image_tensor.detach().clone()
+    if image.ndim == 4:
+        image = image.squeeze(0)
+    mean_broadcast = mean_tensor.to(image.dtype)
+    std_broadcast = std_tensor.to(image.dtype)
+    image = image * std_broadcast + mean_broadcast
+    image = image.clamp(0, 255).to(torch.uint8)
+    image = image.permute(1, 2, 0).cpu().numpy()
+    return image
