@@ -1,4 +1,6 @@
 import logging
+import random
+import time
 from pathlib import Path
 from typing import Any
 
@@ -7,7 +9,10 @@ import torch
 from PIL import Image
 from torch import Tensor
 from torchvision.transforms import v2
-import pywt  # type: ignore
+try:
+    import pywt  # type: ignore
+except ImportError:  # pragma: no cover
+    pywt = None
 
 
 
@@ -20,7 +25,13 @@ _TO_FLOAT_IMAGE = v2.Compose(
     ]
 )
 
-__all__ = ["swap_ll_components", "WaveletLLSwap", "run_wavelet_ll_swap_demo"]
+__all__ = [
+    "swap_ll_components",
+    "WaveletLLSwap",
+    "run_wavelet_ll_swap_demo",
+    "WaveletGlobalCropsWrapper",
+    "BatchWaveletSwapper",
+]
 
 
 def _ensure_chw_tensor(image: Any) -> tuple[Tensor, torch.device]:
@@ -74,6 +85,7 @@ def swap_ll_components(
     mode: str = "reflect",
     clamp: tuple[float, float] | None = (0.0, 1.0),
     levels: int = 1,
+    couple_details: bool = True,
 ) -> tuple[Tensor, Tensor]:
     """
     对两张图片进行二维离散小波变换，并交换它们的 LL 低频分量。
@@ -84,6 +96,10 @@ def swap_ll_components(
         mode: 边界填充模式，参考 pywt.dwt2。
         clamp: 若不为 None，则在返回前对结果进行裁剪，默认为 (0, 1)。
         levels: 小波分解层数，>=1。数值越大，交换越“深层”的低频语义。
+
+    Note:
+        当 `couple_details=True` 且 level>1 时，会同时交换与该 LL 同层级的 (LH, HL, HH) 细节系数，以避免出现明显的拼块边界；
+        设为 False 可保留原始“只交换 LL” 的效果。
 
     Returns:
         交换 LL 分量后的图像对 (image_a_swapped, image_b_swapped)。
@@ -104,7 +120,6 @@ def swap_ll_components(
     numpy_b = image_b.detach().cpu().to(torch.float32).numpy()
 
     max_level = pywt.dwtn_max_level((h, w), wavelet)
-    print(f"max_level: {max_level}")
     if max_level == 0:
         level_to_use = 1
     else:
@@ -113,14 +128,18 @@ def swap_ll_components(
     swapped_a = []
     swapped_b = []
     for channel_a, channel_b in zip(numpy_a, numpy_b):
-        coeffs_a = pywt.wavedec2(channel_a, wavelet=wavelet, mode=mode, level=level_to_use)
-        coeffs_b = pywt.wavedec2(channel_b, wavelet=wavelet, mode=mode, level=level_to_use)
+        coeffs_a = list(pywt.wavedec2(channel_a, wavelet=wavelet, mode=mode, level=level_to_use))
+        coeffs_b = list(pywt.wavedec2(channel_b, wavelet=wavelet, mode=mode, level=level_to_use))
 
-        new_coeffs_a = [coeffs_b[0]] + list(coeffs_a[1:])
-        new_coeffs_b = [coeffs_a[0]] + list(coeffs_b[1:])
+        approx_a, approx_b = coeffs_a[0], coeffs_b[0]
+        coeffs_a[0], coeffs_b[0] = approx_b, approx_a
+        if couple_details and level_to_use > 1:
+            # 同步交换顶层细节，避免 LL 与粗尺度细节风格不一致
+            detail_a, detail_b = coeffs_a[1], coeffs_b[1]
+            coeffs_a[1], coeffs_b[1] = detail_b, detail_a
 
-        recon_a = _reconstruct_channel(new_coeffs_a, (h, w), wavelet=wavelet, mode=mode)
-        recon_b = _reconstruct_channel(new_coeffs_b, (h, w), wavelet=wavelet, mode=mode)
+        recon_a = _reconstruct_channel(coeffs_a, (h, w), wavelet=wavelet, mode=mode)
+        recon_b = _reconstruct_channel(coeffs_b, (h, w), wavelet=wavelet, mode=mode)
         swapped_a.append(recon_a)
         swapped_b.append(recon_b)
 
@@ -150,11 +169,13 @@ class WaveletLLSwap:
         mode: str = "reflect",
         clamp: tuple[float, float] | None = (0.0, 1.0),
         levels: int = 1,
+        couple_details: bool = True,
     ):
         self.wavelet = wavelet
         self.mode = mode
         self.clamp = clamp
         self.levels = levels
+        self.couple_details = couple_details
 
     def __call__(self, image_a: Any, image_b: Any) -> tuple[Tensor, Tensor]:
         tensor_a, device_a = _ensure_chw_tensor(image_a)
@@ -166,8 +187,115 @@ class WaveletLLSwap:
             mode=self.mode,
             clamp=self.clamp,
             levels=self.levels,
+            couple_details=self.couple_details,
         )
         return swapped_a.to(device_a), swapped_b.to(device_b)
+
+class BatchWaveletSwapper:
+    """
+    在 collate 前的 samples_list 上按比例随机抽取样本，两两配对并对指定 global crop 做 LL 交换。
+    仅影响 student 视角，teacher 视角保持不变。
+    """
+
+    def __init__(
+        self,
+        *,
+        swap_ratio: float = 0.5,
+        swap_crop_index: int = 0,
+        wavelet: str = "haar",
+        mode: str = "reflect",
+        clamp: tuple[float, float] | None = (0.0, 1.0),
+        levels: int = 1,
+        couple_details: bool = True,
+        base_transform: Any | None = None,
+    ):
+        if not 0.0 <= swap_ratio <= 1.0:
+            raise ValueError("swap_ratio must be in [0, 1].")
+        if swap_crop_index < 0:
+            raise ValueError("swap_crop_index must be >= 0.")
+        self.swap_ratio = swap_ratio
+        self.swap_crop_index = swap_crop_index
+        if base_transform is None:
+            raise ValueError("BatchWaveletSwapper requires base_transform when enabling wavelet swaps.")
+        self.swap_transform = WaveletLLSwap(
+            wavelet=wavelet,
+            mode=mode,
+            clamp=clamp,
+            levels=levels,
+            couple_details=couple_details,
+        )
+        self.base_transform = base_transform
+        self.last_swapped_pairs: list[tuple[int, int]] = []
+        self.to_pil = v2.ToPILImage()
+
+    def __call__(self, samples_list: list[tuple[dict, Any]]) -> None:
+        if pywt is None:
+            raise ImportError("PyWavelets is required for BatchWaveletSwapper. 请先安装 pywt。")
+        if not samples_list:
+            return
+        self.last_swapped_pairs.clear()
+        num_samples = len(samples_list)
+        if num_samples < 2 or self.swap_ratio <= 0.0:
+            return
+
+        target = int(num_samples * self.swap_ratio)
+        if target < 2:
+            return
+        if target % 2 == 1:
+            target -= 1
+        if target < 2:
+            return
+
+        indices = list(range(num_samples))
+        random.shuffle(indices)
+        selected = indices[:target]
+        if not selected:
+            return
+
+        for i in range(0, len(selected), 2):
+            idx_a, idx_b = selected[i], selected[i + 1]
+            sample_a = samples_list[idx_a][0]
+            sample_b = samples_list[idx_b][0]
+            self._swap_pair(sample_a, sample_b)
+            self.last_swapped_pairs.append((idx_a, idx_b))
+
+    def _swap_pair(self, sample_a: dict, sample_b: dict) -> None:
+        crops_a = sample_a.get("global_crops")
+        crops_b = sample_b.get("global_crops")
+        if (
+            not isinstance(crops_a, list)
+            or not isinstance(crops_b, list)
+            or len(crops_a) <= self.swap_crop_index
+            or len(crops_b) <= self.swap_crop_index
+        ):
+            return
+        bases_a = sample_a.get("_global_bases")
+        bases_b = sample_b.get("_global_bases")
+        if (
+            not isinstance(bases_a, list)
+            or not isinstance(bases_b, list)
+            or len(bases_a) <= self.swap_crop_index
+            or len(bases_b) <= self.swap_crop_index
+        ):
+            return
+        base_a = bases_a[self.swap_crop_index]
+        base_b = bases_b[self.swap_crop_index]
+        tensor_a, _ = _ensure_chw_tensor(base_a)
+        tensor_b, _ = _ensure_chw_tensor(base_b)
+        swapped_a, swapped_b = self.swap_transform(tensor_a, tensor_b)
+        swapped_a_pil = self.to_pil(swapped_a.cpu())
+        swapped_b_pil = self.to_pil(swapped_b.cpu())
+        bases_a[self.swap_crop_index] = swapped_a_pil
+        bases_b[self.swap_crop_index] = swapped_b_pil
+
+        if self.base_transform is not None:
+            self.base_transform.rebuild_sample(sample_a, skip_color_aug=True)
+            self.base_transform.rebuild_sample(sample_b, skip_color_aug=True)
+        else:
+            crops_a[self.swap_crop_index] = swapped_a
+            crops_b[self.swap_crop_index] = swapped_b
+
+
 
 
 def run_wavelet_ll_swap_demo(
@@ -176,6 +304,7 @@ def run_wavelet_ll_swap_demo(
     output_dir: str | Path = "wavelet_ll_swap_outputs",
     *,
     levels: int = 1,
+    couple_details: bool = True,
 ) -> tuple[Path, Path]:
     """
     简易测试单元：读取两张图片，resize 到 512x512，执行 WaveletLLSwap，并将结果保存到本地。
@@ -195,7 +324,7 @@ def run_wavelet_ll_swap_demo(
     image_a = preprocess(Image.open(image_path_a).convert("RGB"))
     image_b = preprocess(Image.open(image_path_b).convert("RGB"))
 
-    swap_transform = WaveletLLSwap(levels=levels)
+    swap_transform = WaveletLLSwap(levels=levels, couple_details=couple_details)
     swapped_a, swapped_b = swap_transform(image_a, image_b)
 
     output_dir = Path(output_dir)
@@ -223,17 +352,25 @@ if __name__ == "__main__":
     parser.add_argument(
         "--levels",
         type=int,
-        default=9,
+        default=7,
         help="小波分解层数，>=1",
     )
+    parser.add_argument(
+        "--decouple-details",
+        action="store_true",
+        help="仅交换 LL 系数，不同步同层级的细节系数（可能出现棋盘状边界）",
+    )
     args = parser.parse_args()
-    image1 = "/mnt/mydata/hong/RMAS/train/img/1.jpg"
-    image2 = "/mnt/mydata/hong/RMAS/train/img/2.jpg"
+    image1 = "/mnt/mydata/hong/RMAS/train/img/732.jpg"
+    image2 = "/mnt/mydata/hong/RMAS/train/img/1907.jpg"
+    start_time = time.time()
     path_a, path_b = run_wavelet_ll_swap_demo(
         image_path_a=image1,
         image_path_b=image2,
         output_dir=args.output_dir,
         levels=args.levels,
+        couple_details=not args.decouple_details,
     )
+    print(f"运行时间: {time.time() - start_time:.3f}s")
     print(f"保存结果: {path_a}")
     print(f"保存结果: {path_b}")
