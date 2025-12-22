@@ -1,4 +1,5 @@
 from pathlib import Path
+import sys
 
 import numpy as np
 import torch
@@ -8,6 +9,11 @@ from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+
+CURRENT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = CURRENT_DIR.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from data.data import build_ssl_dataloader
 from log import init_training_logger

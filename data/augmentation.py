@@ -85,7 +85,7 @@ def swap_ll_components(
     mode: str = "reflect",
     clamp: tuple[float, float] | None = (0.0, 1.0),
     levels: int = 1,
-    couple_details: bool = True,
+    override_levels: int | None = None,
 ) -> tuple[Tensor, Tensor]:
     """
     对两张图片进行二维离散小波变换，并交换它们的 LL 低频分量。
@@ -96,10 +96,6 @@ def swap_ll_components(
         mode: 边界填充模式，参考 pywt.dwt2。
         clamp: 若不为 None，则在返回前对结果进行裁剪，默认为 (0, 1)。
         levels: 小波分解层数，>=1。数值越大，交换越“深层”的低频语义。
-
-    Note:
-        当 `couple_details=True` 且 level>1 时，会同时交换与该 LL 同层级的 (LH, HL, HH) 细节系数，以避免出现明显的拼块边界；
-        设为 False 可保留原始“只交换 LL” 的效果。
 
     Returns:
         交换 LL 分量后的图像对 (image_a_swapped, image_b_swapped)。
@@ -120,26 +116,25 @@ def swap_ll_components(
     numpy_b = image_b.detach().cpu().to(torch.float32).numpy()
 
     max_level = pywt.dwtn_max_level((h, w), wavelet)
-    if max_level == 0:
-        level_to_use = 1
+    if override_levels is not None:
+        level_to_use = max(1, min(override_levels, max_level if max_level > 0 else 1))
     else:
-        level_to_use = min(levels, max_level)
+        if max_level == 0:
+            level_to_use = 1
+        else:
+            level_to_use = min(levels, max_level)
 
     swapped_a = []
     swapped_b = []
     for channel_a, channel_b in zip(numpy_a, numpy_b):
-        coeffs_a = list(pywt.wavedec2(channel_a, wavelet=wavelet, mode=mode, level=level_to_use))
-        coeffs_b = list(pywt.wavedec2(channel_b, wavelet=wavelet, mode=mode, level=level_to_use))
+        coeffs_a = pywt.wavedec2(channel_a, wavelet=wavelet, mode=mode, level=level_to_use)
+        coeffs_b = pywt.wavedec2(channel_b, wavelet=wavelet, mode=mode, level=level_to_use)
 
-        approx_a, approx_b = coeffs_a[0], coeffs_b[0]
-        coeffs_a[0], coeffs_b[0] = approx_b, approx_a
-        if couple_details and level_to_use > 1:
-            # 同步交换顶层细节，避免 LL 与粗尺度细节风格不一致
-            detail_a, detail_b = coeffs_a[1], coeffs_b[1]
-            coeffs_a[1], coeffs_b[1] = detail_b, detail_a
+        new_coeffs_a = [coeffs_b[0]] + list(coeffs_a[1:])
+        new_coeffs_b = [coeffs_a[0]] + list(coeffs_b[1:])
 
-        recon_a = _reconstruct_channel(coeffs_a, (h, w), wavelet=wavelet, mode=mode)
-        recon_b = _reconstruct_channel(coeffs_b, (h, w), wavelet=wavelet, mode=mode)
+        recon_a = _reconstruct_channel(new_coeffs_a, (h, w), wavelet=wavelet, mode=mode)
+        recon_b = _reconstruct_channel(new_coeffs_b, (h, w), wavelet=wavelet, mode=mode)
         swapped_a.append(recon_a)
         swapped_b.append(recon_b)
 
@@ -177,7 +172,7 @@ class WaveletLLSwap:
         self.levels = levels
         self.couple_details = couple_details
 
-    def __call__(self, image_a: Any, image_b: Any) -> tuple[Tensor, Tensor]:
+    def __call__(self, image_a: Any, image_b: Any, *, override_levels: int | None = None) -> tuple[Tensor, Tensor]:
         tensor_a, device_a = _ensure_chw_tensor(image_a)
         tensor_b, device_b = _ensure_chw_tensor(image_b)
         swapped_a, swapped_b = swap_ll_components(
@@ -187,9 +182,15 @@ class WaveletLLSwap:
             mode=self.mode,
             clamp=self.clamp,
             levels=self.levels,
-            couple_details=self.couple_details,
+            override_levels=override_levels,
         )
         return swapped_a.to(device_a), swapped_b.to(device_b)
+
+    def max_decomposition_level(self, hw: tuple[int, int]) -> int:
+        if pywt is None:
+            raise ImportError("PyWavelets is required.")
+        max_level = pywt.dwtn_max_level(hw, self.wavelet)
+        return max_level if max_level > 0 else 1
 
 class BatchWaveletSwapper:
     """
@@ -202,11 +203,12 @@ class BatchWaveletSwapper:
         *,
         swap_ratio: float = 0.5,
         swap_crop_index: int = 0,
+        local_swap_count: int = 0,
+        local_swap_resize: int | None = 128,
         wavelet: str = "haar",
         mode: str = "reflect",
         clamp: tuple[float, float] | None = (0.0, 1.0),
         levels: int = 1,
-        couple_details: bool = True,
         base_transform: Any | None = None,
     ):
         if not 0.0 <= swap_ratio <= 1.0:
@@ -215,6 +217,8 @@ class BatchWaveletSwapper:
             raise ValueError("swap_crop_index must be >= 0.")
         self.swap_ratio = swap_ratio
         self.swap_crop_index = swap_crop_index
+        self.local_swap_count = max(0, int(local_swap_count))
+        self.local_swap_resize = int(local_swap_resize) if local_swap_resize is not None else None
         if base_transform is None:
             raise ValueError("BatchWaveletSwapper requires base_transform when enabling wavelet swaps.")
         self.swap_transform = WaveletLLSwap(
@@ -222,11 +226,11 @@ class BatchWaveletSwapper:
             mode=mode,
             clamp=clamp,
             levels=levels,
-            couple_details=couple_details,
         )
         self.base_transform = base_transform
         self.last_swapped_pairs: list[tuple[int, int]] = []
         self.to_pil = v2.ToPILImage()
+        self._resize_cache: dict[tuple[int, int], v2.Resize] = {}
 
     def __call__(self, samples_list: list[tuple[dict, Any]]) -> None:
         if pywt is None:
@@ -260,6 +264,35 @@ class BatchWaveletSwapper:
             self.last_swapped_pairs.append((idx_a, idx_b))
 
     def _swap_pair(self, sample_a: dict, sample_b: dict) -> None:
+        swapped_globals, teacher_bases = self._swap_global_crop(sample_a, sample_b)
+        teacher_base_a, teacher_base_b = teacher_bases
+        swapped_locals = self._swap_local_crops(sample_a, sample_b)
+        if not swapped_globals and swapped_locals == 0:
+            return
+        if self.base_transform is not None:
+            self._rebuild_student_views(sample_a, swapped_locals, teacher_base=teacher_base_a)
+            self._rebuild_student_views(sample_b, swapped_locals, teacher_base=teacher_base_b)
+        else:
+            crops_a = sample_a.get("global_crops")
+            crops_b = sample_b.get("global_crops")
+            if (
+                isinstance(crops_a, list)
+                and isinstance(crops_b, list)
+                and len(crops_a) > self.swap_crop_index
+                and len(crops_b) > self.swap_crop_index
+            ):
+                bases_a = sample_a.get("_global_bases")
+                bases_b = sample_b.get("_global_bases")
+                if (
+                    isinstance(bases_a, list)
+                    and isinstance(bases_b, list)
+                    and len(bases_a) > self.swap_crop_index
+                    and len(bases_b) > self.swap_crop_index
+                ):
+                    crops_a[self.swap_crop_index] = _ensure_chw_tensor(bases_a[self.swap_crop_index])[0]
+                    crops_b[self.swap_crop_index] = _ensure_chw_tensor(bases_b[self.swap_crop_index])[0]
+
+    def _swap_global_crop(self, sample_a: dict, sample_b: dict) -> tuple[bool, tuple[Any | None, Any | None]]:
         crops_a = sample_a.get("global_crops")
         crops_b = sample_b.get("global_crops")
         if (
@@ -268,7 +301,7 @@ class BatchWaveletSwapper:
             or len(crops_a) <= self.swap_crop_index
             or len(crops_b) <= self.swap_crop_index
         ):
-            return
+            return False, (None, None)
         bases_a = sample_a.get("_global_bases")
         bases_b = sample_b.get("_global_bases")
         if (
@@ -277,23 +310,109 @@ class BatchWaveletSwapper:
             or len(bases_a) <= self.swap_crop_index
             or len(bases_b) <= self.swap_crop_index
         ):
-            return
+            return False, (None, None)
         base_a = bases_a[self.swap_crop_index]
         base_b = bases_b[self.swap_crop_index]
+        teacher_base_a = self._clone_base_object(base_a)
+        teacher_base_b = self._clone_base_object(base_b)
         tensor_a, _ = _ensure_chw_tensor(base_a)
         tensor_b, _ = _ensure_chw_tensor(base_b)
-        swapped_a, swapped_b = self.swap_transform(tensor_a, tensor_b)
+        max_level_global = self.swap_transform.max_decomposition_level((tensor_a.shape[1], tensor_a.shape[2]))
+        level_global = min(max_level_global, self.swap_transform.levels)
+        swapped_a, swapped_b = self.swap_transform(tensor_a, tensor_b, override_levels=level_global)
         swapped_a_pil = self.to_pil(swapped_a.cpu())
         swapped_b_pil = self.to_pil(swapped_b.cpu())
         bases_a[self.swap_crop_index] = swapped_a_pil
         bases_b[self.swap_crop_index] = swapped_b_pil
 
-        if self.base_transform is not None:
-            self.base_transform.rebuild_sample(sample_a, skip_color_aug=True)
-            self.base_transform.rebuild_sample(sample_b, skip_color_aug=True)
-        else:
-            crops_a[self.swap_crop_index] = swapped_a
-            crops_b[self.swap_crop_index] = swapped_b
+        return True, (teacher_base_a, teacher_base_b)
+
+    def _swap_local_crops(self, sample_a: dict, sample_b: dict) -> int:
+        if self.local_swap_count <= 0:
+            return 0
+        bases_a = sample_a.get("_local_bases")
+        bases_b = sample_b.get("_local_bases")
+        if not isinstance(bases_a, list) or not isinstance(bases_b, list):
+            return 0
+        swap_limit = min(self.local_swap_count, len(bases_a), len(bases_b))
+        if swap_limit <= 0:
+            return 0
+
+        swapped = 0
+        for idx in range(swap_limit):
+            base_a = bases_a[idx]
+            base_b = bases_b[idx]
+            tensor_a, _ = _ensure_chw_tensor(base_a)
+            tensor_b, _ = _ensure_chw_tensor(base_b)
+            original_hw = (tensor_a.shape[1], tensor_a.shape[2])
+            proc_a = tensor_a
+            proc_b = tensor_b
+            if self.local_swap_resize is not None and (
+                original_hw[0] != self.local_swap_resize or original_hw[1] != self.local_swap_resize
+            ):
+                proc_a = self._resize_tensor(proc_a, (self.local_swap_resize, self.local_swap_resize))
+                proc_b = self._resize_tensor(proc_b, (self.local_swap_resize, self.local_swap_resize))
+            level_local = self.swap_transform.max_decomposition_level((proc_a.shape[1], proc_a.shape[2]))
+            swapped_a, swapped_b = self.swap_transform(proc_a, proc_b, override_levels=level_local)
+            if (proc_a.shape[1], proc_a.shape[2]) != original_hw:
+                swapped_a = self._resize_tensor(swapped_a, original_hw)
+                swapped_b = self._resize_tensor(swapped_b, original_hw)
+            bases_a[idx] = self.to_pil(swapped_a.cpu())
+            bases_b[idx] = self.to_pil(swapped_b.cpu())
+            swapped += 1
+        return swapped
+
+    def _rebuild_student_views(self, sample: dict, swapped_local_count: int, *, teacher_base: Any | None = None) -> None:
+        self.base_transform.rebuild_sample(sample, skip_color_aug=True)
+        if teacher_base is not None:
+            self._restore_teacher_global(sample, teacher_base)
+        if swapped_local_count <= 0:
+            return
+        self._restore_remaining_local_color_aug(sample, swapped_local_count)
+
+    def _restore_teacher_global(self, sample: dict, teacher_base: Any) -> None:
+        teacher_crops = sample.get("global_crops_teacher")
+        if not isinstance(teacher_crops, list) or len(teacher_crops) <= self.swap_crop_index:
+            return
+        normalize = getattr(self.base_transform, "normalize", None)
+        if normalize is None:
+            return
+        clone_base = getattr(self.base_transform, "_clone_base", None)
+        if clone_base is None:
+            clone_base = self._clone_base_object
+        teacher_crops[self.swap_crop_index] = normalize(clone_base(teacher_base))
+
+    def _restore_remaining_local_color_aug(self, sample: dict, swapped_local_count: int) -> None:
+        local_transfo = getattr(self.base_transform, "local_transfo", None)
+        if local_transfo is None:
+            return
+        local_bases = sample.get("_local_bases")
+        local_crops = sample.get("local_crops")
+        if not isinstance(local_bases, list) or not isinstance(local_crops, list):
+            return
+        total = min(len(local_bases), len(local_crops))
+        if swapped_local_count >= total:
+            return
+        for idx in range(swapped_local_count, total):
+            base = local_bases[idx]
+            if base is None:
+                continue
+            local_crops[idx] = local_transfo(self._clone_base_object(base))
+
+    def _resize_tensor(self, tensor: Tensor, size: tuple[int, int]) -> Tensor:
+        resize = self._resize_cache.get(size)
+        if resize is None:
+            resize = v2.Resize(size, interpolation=v2.InterpolationMode.BICUBIC, antialias=True)
+            self._resize_cache[size] = resize
+        return resize(tensor)
+
+    @staticmethod
+    def _clone_base_object(base: Any) -> Any:
+        if hasattr(base, "copy"):
+            return base.copy()
+        if torch.is_tensor(base):
+            return base.clone()
+        return base
 
 
 
@@ -352,7 +471,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--levels",
         type=int,
-        default=7,
+        default=10,
         help="小波分解层数，>=1",
     )
     parser.add_argument(
@@ -361,8 +480,8 @@ if __name__ == "__main__":
         help="仅交换 LL 系数，不同步同层级的细节系数（可能出现棋盘状边界）",
     )
     args = parser.parse_args()
-    image1 = "/mnt/mydata/hong/RMAS/train/img/732.jpg"
-    image2 = "/mnt/mydata/hong/RMAS/train/img/1907.jpg"
+    image1 = "/mnt/mydata/hong/RMAS_small/test/img/50.jpg"
+    image2 = "/mnt/mydata/hong/RMAS/train/img/300.jpg"
     start_time = time.time()
     path_a, path_b = run_wavelet_ll_swap_demo(
         image_path_a=image1,

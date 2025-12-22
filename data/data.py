@@ -13,7 +13,8 @@ from torch.utils.data.distributed import DistributedSampler
 from torchvision.transforms import v2
 import torchvision.transforms.functional as TF
 
-from dinov3.data.augmentations import DataAugmentationDINO
+from data.dino_augmentations import DataAugmentationDINO
+from data.augmentation import BatchWaveletSwapper
 from dinov3.data.collate import collate_data_and_cast
 from dinov3.data.masking import MaskingGenerator
 from dinov3.eval.segmentation.transforms import (
@@ -65,10 +66,11 @@ def make_enhance_transform(resize_size: int | list[int] = 518) -> Callable:
 class SegmentationFolderDataset(TorchDataset):
     """图像/掩码文件夹对，按文件名匹配。"""
 
-    def __init__(self, image_dir: Path, mask_dir: Path, transforms):
+    def __init__(self, image_dir: Path, mask_dir: Path, transforms, *, keep_image_lists: bool = False):
         self.image_dir = image_dir
         self.mask_dir = mask_dir
         self.transforms = transforms
+        self.keep_image_lists = keep_image_lists
         image_map = self._scan(image_dir, {"jpg", "jpeg", "png"})
         mask_map = self._scan(mask_dir, {"png", "jpg", "jpeg"})
         common = sorted(image_map.keys() & mask_map.keys())
@@ -94,14 +96,19 @@ class SegmentationFolderDataset(TorchDataset):
         orig_size = torch.tensor((mask.height, mask.width), dtype=torch.long)
         file_name = self.image_paths[idx].stem
         image, mask = self.transforms(image, mask)
+        image_tensor = self._prepare_image_tensor(image)
         mask_tensor = self._ensure_long_mask(mask)
         mask_tensor = normalize_binary_mask(mask_tensor)
-        return self._ensure_float_tensor(image), mask_tensor, idx, orig_size, file_name
+        return image_tensor, mask_tensor, idx, orig_size, file_name
+
+    def _prepare_image_tensor(self, image: Any) -> Any:
+        if isinstance(image, list):
+            tensors = [self._ensure_float_tensor(img) for img in image]
+            return tensors if self.keep_image_lists else tensors[0]
+        return self._ensure_float_tensor(image)
 
     @staticmethod
     def _ensure_float_tensor(image: Any) -> torch.Tensor:
-        if isinstance(image, list):
-            image = image[0]
         if not isinstance(image, torch.Tensor):
             image = torch.as_tensor(image)
         return image.float()
@@ -539,6 +546,32 @@ def build_ssl_dataloader(
         mask_generator=mask_generator,
         random_circular_shift=random_circular_shift,
     )
+
+    wavelet_cfg = ssl_cfg.get("wavelet_swap", {})
+    wavelet_ratio = float(wavelet_cfg.get("ratio", 0.0))
+    if wavelet_ratio > 0:
+        clamp_min = wavelet_cfg.get("clamp_min", 0.0)
+        clamp_max = wavelet_cfg.get("clamp_max", 1.0)
+        clamp_tuple = None if wavelet_cfg.get("clamp_disable", False) else (clamp_min, clamp_max)
+        local_swap_count = int(wavelet_cfg.get("local_swap_count"))
+        swapper = BatchWaveletSwapper(
+            swap_ratio=wavelet_ratio,
+            swap_crop_index=int(wavelet_cfg.get("swap_crop_index", 0)),
+            wavelet=wavelet_cfg.get("wavelet", "haar"),
+            mode=wavelet_cfg.get("mode", "reflect"),
+            clamp=clamp_tuple,
+            levels=int(wavelet_cfg.get("levels", 1)),
+            local_swap_count=local_swap_count,
+            base_transform=augmentation,
+        )
+
+        base_collate_fn = collate_fn
+
+        def collate_with_wavelet(samples_list):
+            swapper(samples_list)
+            return base_collate_fn(samples_list)
+
+        collate_fn = collate_with_wavelet
 
     sampler = None
     if distributed:
