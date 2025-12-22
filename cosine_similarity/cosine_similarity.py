@@ -18,9 +18,13 @@ from PIL import Image
 from torchvision import transforms
 import matplotlib.pyplot as plt
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+CURRENT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = CURRENT_DIR.parent  # /home/.../MAS
+REPO_ROOT = PROJECT_ROOT.parent    # /home/.../
+for path in (PROJECT_ROOT, REPO_ROOT):
+    path_str = str(path)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
 
 from MAS.model.model import DINOv3SelfSupervised
 from utils import load_config
