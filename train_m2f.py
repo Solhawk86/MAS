@@ -36,6 +36,7 @@ from transformers.models.mask2former.modeling_mask2former import (
 from MAS.hf_pixel_decoder_custom import DinoCompatibleMask2FormerPixelDecoder
 
 from MAS.data.data import build_segmentation_image_dataloaders_from_cfg
+from MAS.eval_inference import _resolve_eval_inference_params, _run_full_image_inference
 from MAS.log import init_training_logger
 from MAS.eval_metrics import evaluate_prediction_directory, cal_iou
 from MAS.model.backbone_utils import build_backbone
@@ -181,13 +182,6 @@ def _build_targets(
             mask_labels.append(torch.zeros((0, h, w), device=mask.device, dtype=torch.float32))
             class_labels.append(torch.zeros((0,), device=mask.device, dtype=torch.long))
     return mask_labels, class_labels
-
-
-def _semantic_from_logits(class_logits: torch.Tensor, mask_logits: torch.Tensor) -> torch.Tensor:
-    mask_classes = class_logits.softmax(dim=-1)[..., :-1]
-    mask_probs = mask_logits.sigmoid()
-    logits = torch.einsum("bqc,bqhw->bchw", mask_classes, mask_probs)
-    return logits.argmax(dim=1)
 
 
 def _resize_mask_to_size(mask: torch.Tensor, height: int, width: int) -> torch.Tensor:
@@ -367,6 +361,7 @@ def evaluate(
     ignore_index: int,
     autocast_dtype: torch.dtype,
     world_size: int,
+    eval_params: dict,
 ) -> tuple[float, float]:
     model.eval()
     loss_sum = 0.0
@@ -383,20 +378,31 @@ def evaluate(
                 outputs = model(images, mask_labels=mask_labels, class_labels=class_labels)
             loss_sum += float(outputs["loss"].item())
             count += 1
-            preds = _semantic_from_logits(outputs["class_queries_logits"], outputs["masks_queries_logits"])
-            batch_size = preds.shape[0]
+            batch_size = masks.shape[0]
             for b in range(batch_size):
-                pred_mask = preds[b]
                 target_mask = masks[b]
-                if orig_sizes is not None:
-                    target_h = int(orig_sizes[b][0].item())
-                    target_w = int(orig_sizes[b][1].item())
-                    if target_h > 0 and target_w > 0:
-                        pred_mask = _resize_mask_to_size(pred_mask, target_h, target_w)
-                        target_mask = _resize_mask_to_size(target_mask, target_h, target_w)
-                valid = target_mask != ignore_index
+                target_h = int(orig_sizes[b][0].item()) if orig_sizes is not None else int(target_mask.shape[-2])
+                target_w = int(orig_sizes[b][1].item()) if orig_sizes is not None else int(target_mask.shape[-1])
+                if target_h <= 0 or target_w <= 0:
+                    target_h, target_w = target_mask.shape[-2:]
+                target_mask_resized = _resize_mask_to_size(target_mask, target_h, target_w)
+                logits = _run_full_image_inference(
+                    model,
+                    images[b],
+                    eval_params=eval_params,
+                    num_classes=num_classes,
+                    device=device,
+                    autocast_dtype=autocast_dtype,
+                    target_size=(target_h, target_w),
+                )
+                pred_mask = logits.argmax(dim=1).squeeze(0)
+                valid = target_mask_resized != ignore_index
                 pred_clean = torch.where(valid, pred_mask.float(), torch.zeros_like(pred_mask, dtype=torch.float32))
-                target_clean = torch.where(valid, target_mask.float(), torch.zeros_like(target_mask, dtype=torch.float32))
+                target_clean = torch.where(
+                    valid,
+                    target_mask_resized.float(),
+                    torch.zeros_like(pred_mask, dtype=torch.float32),
+                )
                 iou_metric.update(pred_clean.detach().cpu().numpy(), target_clean.detach().cpu().numpy())
     mean_loss = _distributed_mean(torch.tensor([loss_sum / max(1, count)], device=device), world_size)
     local_miou = torch.tensor([float(iou_metric.show())], device=device)
@@ -411,6 +417,8 @@ def export_predictions(
     device: torch.device,
     autocast_dtype: torch.dtype,
     output_dir: Path,
+    num_classes: int,
+    eval_params: dict,
 ) -> None:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -421,17 +429,23 @@ def export_predictions(
             images, _masks, sample_indices, orig_sizes, *rest = batch
             file_names = rest[0] if rest else None
             images = images.to(device, non_blocking=True)
-            with amp.autocast(autocast_device, dtype=autocast_dtype, enabled=device.type == "cuda"):
-                outputs = model(images)
-            preds = _semantic_from_logits(outputs["class_queries_logits"], outputs["masks_queries_logits"])
-            batch_size = preds.shape[0]
+            batch_size = images.shape[0]
             for b in range(batch_size):
-                pred_mask = preds[b]
                 target_h = int(orig_sizes[b][0].item())
                 target_w = int(orig_sizes[b][1].item())
-                if target_h > 0 and target_w > 0:
-                    pred_mask = _resize_mask_to_size(pred_mask, target_h, target_w)
-                mask_tensor = torch.clamp(pred_mask.float(), 0.0, 1.0)
+                if target_h <= 0 or target_w <= 0:
+                    target_h, target_w = images.shape[-2:]
+                logits = _run_full_image_inference(
+                    model,
+                    images[b],
+                    eval_params=eval_params,
+                    num_classes=num_classes,
+                    device=device,
+                    autocast_dtype=autocast_dtype,
+                    target_size=(target_h, target_w),
+                )
+                pred_mask = logits.argmax(dim=1).squeeze(0).float()
+                mask_tensor = torch.clamp(pred_mask, 0.0, 1.0)
                 mask_tensor = (mask_tensor * 255).to(torch.uint8).cpu().numpy()
                 if file_names:
                     stem = str(file_names[b])
@@ -533,8 +547,9 @@ def save_checkpoint(
     global_step: int,
     best_miou: float,
 ) -> None:
+    module = _unwrap(model)
     state = {
-        "head": _extract_head_state(model),
+        "model": module.state_dict(),
         "epoch": epoch,
         "global_step": global_step,
         "best_miou": best_miou,
@@ -544,9 +559,13 @@ def save_checkpoint(
 
 def load_checkpoint(path: Path, model: torch.nn.Module):
     ckpt = torch.load(path, map_location="cpu")
-    head_state = ckpt.get("head") or ckpt.get("model")
-    if head_state is not None:
-        _load_head_state(model, head_state)
+    model_state = ckpt.get("model")
+    if model_state is not None:
+        _unwrap(model).load_state_dict(model_state, strict=False)
+    else:
+        head_state = ckpt.get("head")
+        if head_state is not None:
+            _load_head_state(model, head_state)
     return int(ckpt.get("epoch", 0)), int(ckpt.get("global_step", 0)), float(ckpt.get("best_miou", 0.0))
 
 
@@ -557,6 +576,7 @@ def main() -> None:
     dataset_cfg = cfg.get("dataset", {}) or {}
     weights_cfg = cfg.get("weights", {}) or {}
     eval_cfg = cfg.get("evaluation", {}) or {}
+    eval_inference_params = _resolve_eval_inference_params(dataset_cfg, eval_cfg)
 
     device, rank, world_size, local_rank, distributed = _setup_device_and_distributed()
     mask2former_config = build_mask2former_config(cfg)
@@ -629,6 +649,9 @@ def main() -> None:
     amp_device = "cuda" if device.type == "cuda" else "cpu"
     scaler = amp.GradScaler(amp_device, enabled=(device.type == "cuda" and autocast_dtype == torch.float16))
 
+    eval_interval = max(1, int(train_cfg.get("eval_interval", 1)))
+    save_after_epoch = max(1, int(train_cfg.get("save_after_epoch", 90)))
+
     resume = args.resume or train_cfg.get("resume")
     start_epoch = 0
     global_step = 0
@@ -645,6 +668,7 @@ def main() -> None:
     log_interval = int(train_cfg.get("log_interval", 50))
     grad_clip = float(train_cfg.get("grad_clip", train_cfg.get("grad_clip_norm", 0.0)))
 
+    last_epoch = start_epoch - 1
     for epoch in range(start_epoch, epochs):
         if distributed and hasattr(train_loader, "sampler") and train_loader.sampler is not None:
             train_loader.sampler.set_epoch(epoch)
@@ -667,34 +691,58 @@ def main() -> None:
             autocast_dtype=autocast_dtype,
             grad_accum_steps=grad_accum_steps,
         )
-        eval_loss, miou = evaluate(
-            model=model,
-            loader=val_loader,
-            device=device,
-            num_classes=num_classes,
-            ignore_index=ignore_index,
-            autocast_dtype=autocast_dtype,
-            world_size=world_size,
-        )
+        should_eval = ((epoch + 1) % eval_interval == 0) or (epoch + 1 == epochs)
+        eval_results: tuple[float, float] | None = None
+        if should_eval:
+            eval_results = evaluate(
+                model=model,
+                loader=val_loader,
+                device=device,
+                num_classes=num_classes,
+                ignore_index=ignore_index,
+                autocast_dtype=autocast_dtype,
+                world_size=world_size,
+                eval_params=eval_inference_params,
+            )
         if rank == 0:
             scalars = {
                 "train/loss": train_loss,
-                "eval/loss": eval_loss,
-                "eval/miou": miou,
                 "optimizer/lr": optimizer.param_groups[0]["lr"],
             }
             for k, v in train_metrics.items():
                 scalars[f"train/{k}"] = v
+            if eval_results is not None:
+                eval_loss, miou = eval_results
+                scalars["eval/loss"] = eval_loss
+                scalars["eval/miou"] = miou
             logger.log_scalars(global_step, scalars)
-            logger.log_message(f"[Epoch {epoch}] train_loss={train_loss:.4f} eval_loss={eval_loss:.4f} mIoU={miou:.4f}")
-            improved = miou > best_miou
-            if improved:
-                best_miou = miou
-                save_checkpoint(best_ckpt_path, model, epoch, global_step, best_miou)
-                logger.log_message(f"新的最佳 mIoU={best_miou:.4f}，已更新最佳 checkpoint。")
-            save_checkpoint(last_ckpt_path, model, epoch, global_step, best_miou)
+            if eval_results is not None:
+                eval_loss, miou = eval_results
+                logger.log_message(
+                    f"[Epoch {epoch}] train_loss={train_loss:.4f} eval_loss={eval_loss:.4f} mIoU={miou:.4f}"
+                )
+            else:
+                logger.log_message(f"[Epoch {epoch}] train_loss={train_loss:.4f} (跳过评估 interval={eval_interval})")
+            if eval_results is not None:
+                _, miou = eval_results
+                if miou > best_miou:
+                    best_miou = miou
+                    if (epoch + 1) >= save_after_epoch:
+                        save_checkpoint(best_ckpt_path, model, epoch, global_step, best_miou)
+                        logger.log_message(
+                            f"新的最佳 mIoU={best_miou:.4f}，已更新最佳 checkpoint (epoch {epoch})."
+                        )
+                    else:
+                        logger.log_message(
+                            f"新的最佳 mIoU={best_miou:.4f}"
+                        )
+        last_epoch = epoch
         if distributed:
             dist.barrier()
+
+    if rank == 0:
+        save_checkpoint(last_ckpt_path, model, last_epoch if last_epoch >= 0 else epochs - 1, global_step, best_miou)
+        logger.log_message(f"最后一个 epoch 的权重已保存至: {last_ckpt_path}")
 
     pred_dir_path = Path(pred_dir_setting)
     if not pred_dir_path.is_absolute():
@@ -705,6 +753,8 @@ def main() -> None:
         device=device,
         autocast_dtype=autocast_dtype,
         output_dir=pred_dir_path,
+        num_classes=num_classes,
+        eval_params=eval_inference_params,
     )
     if distributed:
         dist.barrier()
