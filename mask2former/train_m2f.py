@@ -11,8 +11,9 @@ import argparse
 import math
 from collections import defaultdict
 from pathlib import Path
-from typing import Iterable, Sequence
 import sys
+
+from MAS.mask2former.utils import _as_dtype
 
 CURRENT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = CURRENT_DIR.parent
@@ -28,20 +29,14 @@ from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 from PIL import Image
 
-from transformers import Mask2FormerConfig
-from transformers.models.mask2former.modeling_mask2former import (
-    Mask2FormerLoss,
-    Mask2FormerTransformerModule,
-)
-from MAS.hf_pixel_decoder_custom import DinoCompatibleMask2FormerPixelDecoder
-
 from MAS.data.data import build_segmentation_image_dataloaders_from_cfg
 from MAS.eval_inference import _resolve_eval_inference_params, _run_full_image_inference
 from MAS.log import init_training_logger
 from MAS.eval_metrics import evaluate_prediction_directory, cal_iou
 from MAS.model.backbone_utils import build_backbone
 from MAS.utils import _distributed_mean, _setup_device_and_distributed, load_config
-from dinov3.eval.segmentation.models import BackboneLayersSet
+from MAS.mask2former.utils import *
+from MAS.mask2former.model import DinoMask2Former
 from dinov3.eval.segmentation.models.backbone.dinov3_adapter import DINOv3_Adapter
 
 
@@ -52,107 +47,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", type=str, default=None, help="可选：恢复训练的 checkpoint")
     return parser.parse_args()
 
-
-def build_mask2former_config(cfg: dict) -> Mask2FormerConfig:
-    dataset_cfg = cfg.get("dataset", {}) or {}
-    mask2former_cfg = cfg.get("mask2former", {}) or {}
-    num_classes = int(dataset_cfg.get("num_classes", mask2former_cfg.get("num_classes", 2)))
-    ignore_value = int(dataset_cfg.get("ignore_index", mask2former_cfg.get("ignore_value", -1)))
-    hidden_dim = int(mask2former_cfg.get("hidden_dim", 256))
-    ffn_dim = int(mask2former_cfg.get("ffn_dim", 2048))
-    return Mask2FormerConfig(
-        feature_size=int(mask2former_cfg.get("feature_size", hidden_dim)),
-        mask_feature_size=int(mask2former_cfg.get("mask_feature_size", hidden_dim)),
-        hidden_dim=hidden_dim,
-        encoder_feedforward_dim=ffn_dim,
-        encoder_layers=int(mask2former_cfg.get("encoder_layers", 6)),
-        decoder_layers=int(mask2former_cfg.get("decoder_layers", 9)),
-        num_attention_heads=int(mask2former_cfg.get("num_heads", 8)),
-        dim_feedforward=ffn_dim,
-        dropout=float(mask2former_cfg.get("dropout", 0)),
-        pre_norm=bool(mask2former_cfg.get("pre_norm", False)),
-        enforce_input_projection=bool(mask2former_cfg.get("enforce_input_projection", False)),
-        common_stride=int(mask2former_cfg.get("common_stride", 4)),
-        num_queries=int(mask2former_cfg.get("num_queries", 100)),
-        no_object_weight=float(mask2former_cfg.get("no_object_weight", 0.1)),
-        class_weight=float(mask2former_cfg.get("class_weight", 2.0)),
-        mask_weight=float(mask2former_cfg.get("mask_weight", 5.0)),
-        dice_weight=float(mask2former_cfg.get("dice_weight", 5.0)),
-        train_num_points=int(mask2former_cfg.get("train_num_points", 11250)),
-        oversample_ratio=float(mask2former_cfg.get("oversample_ratio", 3.0)),
-        importance_sample_ratio=float(mask2former_cfg.get("importance_sample_ratio", 0.75)),
-        feature_strides=list(mask2former_cfg.get("feature_strides", [4, 8, 16, 32])),
-        num_labels=num_classes,
-        ignore_value=ignore_value,
-        use_auxiliary_loss=True,
-        output_auxiliary_logits=True,
-    )
-
-
-def resolve_interaction_indices(backbone: torch.nn.Module, cfg: dict) -> list[int]:
-    spec = (
-        cfg.get("model", {}).get("backbone_out_layers")
-        or cfg.get("backbone", {}).get("backbone_out_layers")
-        or BackboneLayersSet.FOUR_EVEN_INTERVALS.name
-    )
-    n_blocks = getattr(backbone, "n_blocks", None)
-    if isinstance(spec, str):
-        try:
-            layerset = BackboneLayersSet[spec]
-        except KeyError:
-            values = [int(part.strip()) for part in spec.split(",") if part.strip()]
-            if not values:
-                raise ValueError(f"无法解析 backbone_out_layers = {spec}")
-            return values
-        if n_blocks is None:
-            raise ValueError("backbone 缺少 n_blocks，无法根据枚举推断层索引")
-        if layerset == BackboneLayersSet.LAST:
-            return [n_blocks - 1]
-        if layerset == BackboneLayersSet.FOUR_LAST:
-            return list(range(max(0, n_blocks - 4), n_blocks))
-        if layerset == BackboneLayersSet.FOUR_EVEN_INTERVALS:
-            if n_blocks == 24:
-                return [4, 11, 17, 23]
-            step = max(1, n_blocks // 4)
-            return [min(n_blocks - 1, step * i - 1) for i in range(1, 5)]
-        raise ValueError(f"暂不支持的 BackboneLayersSet: {layerset}")
-    if isinstance(spec, int):
-        if n_blocks is None:
-            raise ValueError("整数模式需要 backbone.n_blocks")
-        count = max(1, spec)
-        return list(range(max(0, n_blocks - count), n_blocks))
-    if isinstance(spec, Iterable):
-        values = [int(v) for v in spec]
-        if not values:
-            raise ValueError("backbone_out_layers 不能为空")
-        return values
-    raise TypeError(f"无法解析的 backbone_out_layers 类型: {type(spec)}")
-
-
 def _unwrap(module: torch.nn.Module) -> torch.nn.Module:
     return module.module if isinstance(module, DDP) else module
-
-
-def _distributed_sum(tensor: torch.Tensor) -> torch.Tensor:
-    if not dist.is_available() or not dist.is_initialized():
-        return tensor
-    clone = tensor.clone()
-    dist.all_reduce(clone, op=dist.ReduceOp.SUM)
-    return clone
-
-
-def _as_dtype(name: str, device_type: str) -> torch.dtype:
-    key = (name or "").strip().lower()
-    if key in {"bf16", "bfloat16"}:
-        return torch.bfloat16
-    if key in {"fp16", "half", "float16"}:
-        if device_type != "cuda":
-            raise ValueError("float16 自动混合精度仅支持 CUDA")
-        return torch.float16
-    if key in {"fp32", "float32", "f32", ""}:
-        return torch.float32
-    raise ValueError(f"未知的 autocast dtype: {name}")
-
 
 def _build_targets(
     masks: torch.Tensor,
@@ -197,90 +93,6 @@ def _resize_mask_to_size(mask: torch.Tensor, height: int, width: int) -> torch.T
         .squeeze(0)
     )
     return resized.to(mask.dtype)
-
-
-class DinoMask2Former(torch.nn.Module):
-    def __init__(self, feature_extractor: torch.nn.Module, config: Mask2FormerConfig, feature_order: Sequence[str]):
-        super().__init__()
-        self.feature_extractor = feature_extractor
-        self.feature_order = list(feature_order)
-        backbone = getattr(feature_extractor, "backbone", feature_extractor)
-        embed_dim = getattr(backbone, "embed_dim", None)
-        if embed_dim is None:
-            raise ValueError("无法从 DINOv3 主干中推断 embed_dim")
-        self.pixel_decoder = DinoCompatibleMask2FormerPixelDecoder(
-            config,
-            feature_channels=[int(embed_dim)] * len(self.feature_order),
-        )
-        self.transformer_module = Mask2FormerTransformerModule(in_features=config.feature_size, config=config)
-        self.class_predictor = torch.nn.Linear(config.hidden_dim, config.num_labels + 1)
-        self.criterion = Mask2FormerLoss(
-            config=config,
-            weight_dict={
-                "loss_cross_entropy": config.class_weight,
-                "loss_mask": config.mask_weight,
-                "loss_dice": config.dice_weight,
-            },
-        )
-        self.config = config
-        self.feature_extractor.eval()
-        self.feature_extractor.requires_grad_(False)
-        self._logged_feature_info = False
-
-    def forward(
-        self,
-        pixel_values: torch.Tensor,
-        mask_labels: list[torch.Tensor] | None = None,
-        class_labels: list[torch.Tensor] | None = None,
-    ):
-        with torch.no_grad():
-            features_dict = self.feature_extractor(pixel_values)
-        features = [features_dict[key] for key in self.feature_order if key in features_dict]
-        if not self._logged_feature_info:
-            info = ", ".join(f"{key}:{tuple(features_dict[key].shape)}" for key in self.feature_order if key in features_dict)
-            print(f"[DINOv3 Adapter Features] {info}")
-            self._logged_feature_info = True
-        decoder_out = self.pixel_decoder(
-            features,
-            output_hidden_states=True,
-            output_attentions=self.config.output_attentions,
-            return_dict=True,
-        )
-        transformer_out = self.transformer_module(
-            multi_scale_features=list(decoder_out.multi_scale_features),
-            mask_features=decoder_out.mask_features,
-            output_hidden_states=True,
-            output_attentions=self.config.output_attentions,
-        )
-        class_queries = tuple(
-            self.class_predictor(hidden_state.transpose(0, 1))
-            for hidden_state in transformer_out.intermediate_hidden_states
-        )
-        masks_queries = transformer_out.masks_queries_logits
-        aux = [
-            {
-                "class_queries_logits": cls,
-                "masks_queries_logits": mask,
-            }
-            for cls, mask in zip(class_queries[:-1], masks_queries[:-1])
-        ]
-        loss = None
-        loss_dict: dict[str, torch.Tensor] = {}
-        if mask_labels is not None and class_labels is not None:
-            loss_dict = self.criterion(
-                masks_queries_logits=masks_queries[-1],
-                class_queries_logits=class_queries[-1],
-                mask_labels=mask_labels,
-                class_labels=class_labels,
-                auxiliary_predictions=aux,
-            )
-            loss = sum(loss_dict.values())
-        return {
-            "loss": loss,
-            "loss_dict": loss_dict,
-            "class_queries_logits": class_queries[-1],
-            "masks_queries_logits": masks_queries[-1],
-        }
 
 
 def train_one_epoch(
@@ -520,26 +332,6 @@ def build_scheduler(optimizer: torch.optim.Optimizer, train_cfg: dict, steps_per
         return scheduler, "epoch"
     raise ValueError(f"未知的 scheduler 类型: {sched_type}")
 
-
-def _extract_head_state(model: torch.nn.Module) -> dict[str, dict[str, torch.Tensor]]:
-    module = _unwrap(model)
-    return {
-        "pixel_decoder": module.pixel_decoder.state_dict(),
-        "transformer_module": module.transformer_module.state_dict(),
-        "class_predictor": module.class_predictor.state_dict(),
-    }
-
-
-def _load_head_state(model: torch.nn.Module, state: dict[str, dict[str, torch.Tensor]]) -> None:
-    module = _unwrap(model)
-    if "pixel_decoder" in state:
-        module.pixel_decoder.load_state_dict(state["pixel_decoder"], strict=False)
-    if "transformer_module" in state:
-        module.transformer_module.load_state_dict(state["transformer_module"], strict=False)
-    if "class_predictor" in state:
-        module.class_predictor.load_state_dict(state["class_predictor"], strict=False)
-
-
 def save_checkpoint(
     path: Path,
     model: torch.nn.Module,
@@ -555,19 +347,6 @@ def save_checkpoint(
         "best_miou": best_miou,
     }
     torch.save(state, path)
-
-
-def load_checkpoint(path: Path, model: torch.nn.Module):
-    ckpt = torch.load(path, map_location="cpu")
-    model_state = ckpt.get("model")
-    if model_state is not None:
-        _unwrap(model).load_state_dict(model_state, strict=False)
-    else:
-        head_state = ckpt.get("head")
-        if head_state is not None:
-            _load_head_state(model, head_state)
-    return int(ckpt.get("epoch", 0)), int(ckpt.get("global_step", 0)), float(ckpt.get("best_miou", 0.0))
-
 
 def main() -> None:
     args = parse_args()
@@ -652,16 +431,9 @@ def main() -> None:
     eval_interval = max(1, int(train_cfg.get("eval_interval", 1)))
     save_after_epoch = max(1, int(train_cfg.get("save_after_epoch", 90)))
 
-    resume = args.resume or train_cfg.get("resume")
     start_epoch = 0
     global_step = 0
     best_miou = 0.0
-    if resume:
-        ckpt_path = Path(resume)
-        if ckpt_path.is_file():
-            start_epoch, global_step, best_miou = load_checkpoint(ckpt_path, model)
-            if rank == 0:
-                logger.log_message(f"已从 {ckpt_path} 恢复 (epoch={start_epoch}, step={global_step})")
 
     num_classes = int(dataset_cfg.get("num_classes", mask2former_config.num_labels))
     ignore_index = int(dataset_cfg.get("ignore_index", mask2former_config.ignore_value))
