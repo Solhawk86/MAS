@@ -201,6 +201,19 @@ class CocoInstanceDataset(Dataset):
         return mask_tensor, class_tensor
 
 
+def coco_instance_collate_fn(batch):
+    """自定义 collate：保持实例掩码列表的变长形状。"""
+
+    images, semantic_masks, indices, orig_sizes, file_names, extras = zip(*batch)
+    image_tensor = torch.stack(images, dim=0)
+    semantic_tensor = torch.stack(semantic_masks, dim=0)
+    index_tensor = torch.as_tensor(indices, dtype=torch.long)
+    orig_tensor = torch.stack(orig_sizes, dim=0)
+    file_name_list = list(file_names)
+    extras_list = list(extras)
+    return image_tensor, semantic_tensor, index_tensor, orig_tensor, file_name_list, extras_list
+
+
 def build_coco_instance_datasets_from_cfg(dataset_cfg: dict):
     """Create train/val ``CocoInstanceDataset`` from YAML config.
 
@@ -267,6 +280,7 @@ def build_coco_instance_dataloaders_from_cfg(
         shuffle=True,
         pin_memory=pin_memory,
         distributed=distributed,
+        collate_fn=coco_instance_collate_fn,
     )
     val_loader = _build_dataloader(
         val_dataset,
@@ -275,6 +289,7 @@ def build_coco_instance_dataloaders_from_cfg(
         shuffle=False,
         pin_memory=pin_memory,
         distributed=distributed,
+        collate_fn=coco_instance_collate_fn,
     )
     return train_loader, val_loader
 

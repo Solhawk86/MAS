@@ -177,6 +177,7 @@ def _build_dataloader(
     shuffle: bool,
     pin_memory: bool,
     distributed: bool,
+    collate_fn: Optional[Callable] = None,
 ):
     sampler = DistributedSampler(dataset, shuffle=shuffle, drop_last=False) if distributed else None
     return DataLoader(
@@ -187,6 +188,7 @@ def _build_dataloader(
         num_workers=num_workers,
         pin_memory=pin_memory,
         drop_last=False,
+        collate_fn=collate_fn,
     )
 
 
