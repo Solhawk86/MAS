@@ -4,8 +4,8 @@ from typing import Iterable, Sequence
 from transformers import Mask2FormerConfig
 from dinov3.eval.segmentation.models import BackboneLayersSet
 
-def build_mask2former_config(cfg: dict) -> Mask2FormerConfig:
-    dataset_cfg = cfg.get("dataset", {}) or {}
+def build_mask2former_config(cfg: dict, *, dataset_key: str | None = "dataset") -> Mask2FormerConfig:
+    dataset_cfg = cfg.get(dataset_key, {}) or {}
     mask2former_cfg = cfg.get("mask2former", {}) or {}
     num_classes = int(dataset_cfg.get("num_classes", mask2former_cfg.get("num_classes", 2)))
     ignore_value = int(dataset_cfg.get("ignore_index", mask2former_cfg.get("ignore_value", -1)))
