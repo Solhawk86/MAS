@@ -177,15 +177,18 @@ def _queries_to_coco_instances(
         ).squeeze(0).squeeze(0)
         mask_np = mask_resized.detach().float().cpu().numpy()
         binary = (mask_np >= 0.5).astype(np.uint8)
-        if binary.sum() == 0:
+        mask_area = int(binary.sum())
+        if mask_area == 0:
             continue
+        mask_confidence = float((mask_np * binary).sum() / (mask_area + 1e-6))
+        final_score = float(score * mask_confidence)
         rle = mask_utils.encode(np.asfortranarray(binary))
         rle["counts"] = rle["counts"].decode("ascii")
         bbox = mask_utils.toBbox(rle).tolist()
         predictions.append(
             {
                 "segmentation": rle,
-                "score": float(score),
+                "score": final_score,
                 "category_id": cls,
                 "bbox": bbox,
             }

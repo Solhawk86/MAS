@@ -97,11 +97,10 @@ class CocoInstanceDataset(Dataset):
         anns: Sequence[Dict[str, Any]],
         height: int,
         width: int,
-    ) -> Tuple[np.ndarray, Dict[int, int]]:
+    ) -> Tuple[np.ndarray, List[int]]:
         semantic = np.full((height, width), self.ignore_index, dtype=np.int64)
-        instance_map = np.zeros((height, width), dtype=np.int64)
-        instance_id_to_class: Dict[int, int] = {}
-        next_instance_id = 1
+        mask_channels: List[np.ndarray] = []
+        class_ids: List[int] = []
 
         for ann in anns:
             if ann.get("iscrowd", 0):
@@ -114,12 +113,16 @@ class CocoInstanceDataset(Dataset):
                 continue
             mask = mask.astype(bool)
             semantic[mask] = category_id
-            instance_map[mask] = next_instance_id
-            instance_id_to_class[next_instance_id] = category_id
-            next_instance_id += 1
 
-        stacked = np.stack([semantic, instance_map], axis=-1)
-        return stacked, instance_id_to_class
+            channel = np.full((height, width), self.ignore_index, dtype=np.int64)
+            channel[mask] = self.ignore_index + len(mask_channels) + 1
+            mask_channels.append(channel)
+            class_ids.append(category_id)
+
+        stacked = semantic[..., None]
+        if mask_channels:
+            stacked = np.concatenate([stacked, np.stack(mask_channels, axis=-1)], axis=-1)
+        return stacked, class_ids
 
     def __getitem__(self, index: int):  # type: ignore[override]
         image_id = self.img_ids[index]
@@ -127,7 +130,7 @@ class CocoInstanceDataset(Dataset):
         file_name = img_info["file_name"]
         image = Image.open(self.image_root / file_name).convert("RGB")
         anns = self.coco.loadAnns(self.coco.getAnnIds(imgIds=[image_id]))
-        label_np, instance_map = self._build_label_tensor(anns, img_info["height"], img_info["width"])
+        label_np, mask_class_ids = self._build_label_tensor(anns, img_info["height"], img_info["width"])
 
         if self.transforms is not None:
             image, label_np = self.transforms(image, label_np)
@@ -136,9 +139,13 @@ class CocoInstanceDataset(Dataset):
         label_tensor = self._ensure_label_tensor(label_np)
 
         semantic_tensor = label_tensor[0].long()
-        instance_tensor = label_tensor[1].long()
+        instance_layers = label_tensor[1:]
 
-        instance_masks, class_labels = self._extract_instances(instance_tensor, semantic_tensor, instance_map)
+        instance_masks, class_labels = self._extract_instances(
+            instance_layers,
+            mask_class_ids,
+            (semantic_tensor.shape[-2], semantic_tensor.shape[-1]),
+        )
 
         extras = {
             "instance_masks": instance_masks,
@@ -173,29 +180,25 @@ class CocoInstanceDataset(Dataset):
 
     def _extract_instances(
         self,
-        instance_tensor: torch.Tensor,
-        semantic_tensor: torch.Tensor,
-        instance_map: Dict[int, int],
+        instance_layers: torch.Tensor,
+        class_ids: Sequence[int],
+        spatial_size: Tuple[int, int],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        unique_ids = torch.unique(instance_tensor)
         masks: List[torch.Tensor] = []
-        class_ids: List[int] = []
-        height, width = semantic_tensor.shape[-2:]
-        for inst_id in unique_ids.tolist():
-            if inst_id <= 0:
-                continue
-            cls = instance_map.get(int(inst_id))
-            if cls is None:
-                continue
-            binary = (instance_tensor == inst_id).float()
+        labels: List[int] = []
+
+        for layer, cls in zip(instance_layers, class_ids):
+            binary = (layer != self.ignore_index).float()
             if binary.max() <= 0:
                 continue
             masks.append(binary)
-            class_ids.append(cls)
+            labels.append(cls)
+
         if masks:
             mask_tensor = torch.stack(masks, dim=0)
-            class_tensor = torch.as_tensor(class_ids, dtype=torch.long)
+            class_tensor = torch.as_tensor(labels, dtype=torch.long)
         else:
+            height, width = spatial_size
             mask_tensor = torch.zeros((0, height, width), dtype=torch.float32)
             class_tensor = torch.zeros((0,), dtype=torch.long)
         return mask_tensor, class_tensor

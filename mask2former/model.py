@@ -24,13 +24,14 @@ class DinoMask2Former(torch.nn.Module):
         )
         self.transformer_module = Mask2FormerTransformerModule(in_features=config.feature_size, config=config)
         self.class_predictor = torch.nn.Linear(config.hidden_dim, config.num_labels + 1)
+        self.loss_weights = {
+            "loss_cross_entropy": config.class_weight,
+            "loss_mask": config.mask_weight,
+            "loss_dice": config.dice_weight,
+        }
         self.criterion = Mask2FormerLoss(
             config=config,
-            weight_dict={
-                "loss_cross_entropy": config.class_weight,
-                "loss_mask": config.mask_weight,
-                "loss_dice": config.dice_weight,
-            },
+            weight_dict=self.loss_weights,
         )
         self.config = config
         self.feature_extractor.eval()
@@ -84,7 +85,16 @@ class DinoMask2Former(torch.nn.Module):
                 class_labels=class_labels,
                 auxiliary_predictions=aux,
             )
-            loss = sum(loss_dict.values())
+            weighted: dict[str, torch.Tensor] = {}
+            for key, value in loss_dict.items():
+                weight = 1.0
+                for base_key, base_weight in self.loss_weights.items():
+                    if key.startswith(base_key):
+                        weight = base_weight
+                        break
+                weighted[key] = value * weight
+            loss_dict = weighted
+            loss = sum(weighted.values())
         return {
             "loss": loss,
             "loss_dict": loss_dict,
