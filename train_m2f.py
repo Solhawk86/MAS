@@ -13,9 +13,6 @@ from collections import defaultdict
 from pathlib import Path
 import sys
 
-
-import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 CURRENT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = CURRENT_DIR.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -28,58 +25,39 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
-from PIL import Image
 
 from MAS.data.data import build_segmentation_image_dataloaders_from_cfg
-from MAS.eval_inference import _resolve_eval_inference_params, _run_full_image_inference
+from MAS.evaluation.inference import (
+    _resolve_eval_inference_params,
+    _run_full_image_inference,
+    export_predictions,
+)
 from MAS.log import init_training_logger
-from MAS.eval_metrics import evaluate_prediction_directory, cal_iou
+from MAS.evaluation.metrics import evaluate_prediction_directory, cal_iou
 from MAS.model.backbone_utils import build_backbone
 from MAS.utils import _distributed_mean, _setup_device_and_distributed, load_config
 from MAS.mask2former.utils import *
 from MAS.mask2former.model import DinoMask2Former
 from dinov3.eval.segmentation.models.backbone.dinov3_adapter import DINOv3_Adapter
-from MAS.mask2former.utils import _as_dtype
+from MAS.mask2former.utils import _as_dtype, _build_targets
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train HF Mask2Former head on top of frozen DINOv3")
+    parser = argparse.ArgumentParser(
+        description="Train HF Mask2Former head on top of frozen DINOv3"
+    )
     default_cfg = Path(__file__).resolve().with_name("config_m2f_segmentation.yaml")
-    parser.add_argument("--config", type=str, default=str(default_cfg), help="YAML 配置文件路径")
-    parser.add_argument("--resume", type=str, default=None, help="可选：恢复训练的 checkpoint")
+    parser.add_argument(
+        "--config", type=str, default=str(default_cfg), help="YAML 配置文件路径"
+    )
+    parser.add_argument(
+        "--resume", type=str, default=None, help="可选：恢复训练的 checkpoint"
+    )
     return parser.parse_args()
+
 
 def _unwrap(module: torch.nn.Module) -> torch.nn.Module:
     return module.module if isinstance(module, DDP) else module
-
-def _build_targets(
-    masks: torch.Tensor,
-    *,
-    num_classes: int,
-    ignore_index: int,
-) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
-    mask_labels: list[torch.Tensor] = []
-    class_labels: list[torch.Tensor] = []
-    for mask in masks:
-        unique_vals = torch.unique(mask)
-        bin_masks: list[torch.Tensor] = []
-        cls_ids: list[int] = []
-        for value in unique_vals.tolist():
-            if value == ignore_index or value < 0 or value >= num_classes:
-                continue
-            binary = (mask == value).float()
-            if torch.count_nonzero(binary) == 0:
-                continue
-            bin_masks.append(binary)
-            cls_ids.append(int(value))
-        if bin_masks:
-            mask_labels.append(torch.stack(bin_masks))
-            class_labels.append(torch.as_tensor(cls_ids, device=mask.device, dtype=torch.long))
-        else:
-            h, w = mask.shape[-2:]
-            mask_labels.append(torch.zeros((0, h, w), device=mask.device, dtype=torch.float32))
-            class_labels.append(torch.zeros((0,), device=mask.device, dtype=torch.long))
-    return mask_labels, class_labels
 
 
 def _resize_mask_to_size(mask: torch.Tensor, height: int, width: int) -> torch.Tensor:
@@ -118,6 +96,8 @@ def train_one_epoch(
     grad_accum_steps: int,
 ) -> tuple[int, float, dict[str, float]]:
     model.train()
+    base_model = _unwrap(model)
+    num_queries = getattr(getattr(base_model, "config", None), "num_queries", None)
     total_steps = len(loader)
     loss_sum = 0.0
     metrics: defaultdict[str, float] = defaultdict(float)
@@ -127,8 +107,12 @@ def train_one_epoch(
         images, masks, *_ = batch
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
-        mask_labels, class_labels = _build_targets(masks, num_classes=num_classes, ignore_index=ignore_index)
-        with amp.autocast(autocast_device, dtype=autocast_dtype, enabled=device.type == "cuda"):
+        mask_labels, class_labels = _build_targets(
+            masks, num_classes=num_classes, ignore_index=ignore_index
+        )
+        with amp.autocast(
+            autocast_device, dtype=autocast_dtype, enabled=device.type == "cuda"
+        ):
             outputs = model(images, mask_labels=mask_labels, class_labels=class_labels)
             loss = outputs["loss"]
             if grad_accum_steps > 1:
@@ -155,10 +139,30 @@ def train_one_epoch(
         for k, v in outputs["loss_dict"].items():
             metrics[k] += float(v.item())
         if logger is not None and log_interval > 0 and (step + 1) % log_interval == 0:
-            logger.log_message(f"[Epoch {epoch} Step {step+1}/{total_steps}] loss={outputs['loss'].item():.4f}")
-    mean_loss = _distributed_mean(torch.tensor([loss_sum / max(1, total_steps)], device=device), world_size)
+            raw_losses = outputs.get("raw_loss_dict") or {}
+            raw_str = ""
+            if raw_losses:
+                wanted = {k: raw_losses[k] for k in ("loss_mask", "loss_dice", "loss_cross_entropy", "depth_loss") if k in raw_losses}
+                if wanted:
+                    parts = []
+                    for key, value in wanted.items():
+                        if torch.is_tensor(value):
+                            parts.append(f"{key}={float(value.item()):.4f}")
+                        else:
+                            parts.append(f"{key}={float(value):.4f}")
+                    raw_str = " | " + ", ".join(parts)
+            logger.log_message(
+                f"[Epoch {epoch} Step {step+1}/{total_steps}] loss={outputs['loss'].item():.4f}{raw_str}"
+            )
+    mean_loss = _distributed_mean(
+        torch.tensor([loss_sum / max(1, total_steps)], device=device), world_size
+    )
     avg_metrics = {
-        k: float(_distributed_mean(torch.tensor([v / max(1, total_steps)], device=device), world_size).item())
+        k: float(
+            _distributed_mean(
+                torch.tensor([v / max(1, total_steps)], device=device), world_size
+            ).item()
+        )
         for k, v in metrics.items()
     }
     if scheduler is not None and scheduler_interval == "epoch":
@@ -187,19 +191,35 @@ def evaluate(
             images, masks, _indices, orig_sizes, *_ = batch
             images = images.to(device, non_blocking=True)
             masks = masks.to(device, non_blocking=True)
-            mask_labels, class_labels = _build_targets(masks, num_classes=num_classes, ignore_index=ignore_index)
-            with amp.autocast(autocast_device, dtype=autocast_dtype, enabled=device.type == "cuda"):
-                outputs = model(images, mask_labels=mask_labels, class_labels=class_labels)
+            mask_labels, class_labels = _build_targets(
+                masks, num_classes=num_classes, ignore_index=ignore_index
+            )
+            with amp.autocast(
+                autocast_device, dtype=autocast_dtype, enabled=device.type == "cuda"
+            ):
+                outputs = model(
+                    images, mask_labels=mask_labels, class_labels=class_labels
+                )
             loss_sum += float(outputs["loss"].item())
             count += 1
             batch_size = masks.shape[0]
             for b in range(batch_size):
                 target_mask = masks[b]
-                target_h = int(orig_sizes[b][0].item()) if orig_sizes is not None else int(target_mask.shape[-2])
-                target_w = int(orig_sizes[b][1].item()) if orig_sizes is not None else int(target_mask.shape[-1])
+                target_h = (
+                    int(orig_sizes[b][0].item())
+                    if orig_sizes is not None
+                    else int(target_mask.shape[-2])
+                )
+                target_w = (
+                    int(orig_sizes[b][1].item())
+                    if orig_sizes is not None
+                    else int(target_mask.shape[-1])
+                )
                 if target_h <= 0 or target_w <= 0:
                     target_h, target_w = target_mask.shape[-2:]
-                target_mask_resized = _resize_mask_to_size(target_mask, target_h, target_w)
+                target_mask_resized = _resize_mask_to_size(
+                    target_mask, target_h, target_w
+                )
                 logits = _run_full_image_inference(
                     model,
                     images[b],
@@ -211,65 +231,26 @@ def evaluate(
                 )
                 pred_mask = logits.argmax(dim=1).squeeze(0)
                 valid = target_mask_resized != ignore_index
-                pred_clean = torch.where(valid, pred_mask.float(), torch.zeros_like(pred_mask, dtype=torch.float32))
+                pred_clean = torch.where(
+                    valid,
+                    pred_mask.float(),
+                    torch.zeros_like(pred_mask, dtype=torch.float32),
+                )
                 target_clean = torch.where(
                     valid,
                     target_mask_resized.float(),
                     torch.zeros_like(pred_mask, dtype=torch.float32),
                 )
-                iou_metric.update(pred_clean.detach().cpu().numpy(), target_clean.detach().cpu().numpy())
-    mean_loss = _distributed_mean(torch.tensor([loss_sum / max(1, count)], device=device), world_size)
+                iou_metric.update(
+                    pred_clean.detach().cpu().numpy(),
+                    target_clean.detach().cpu().numpy(),
+                )
+    mean_loss = _distributed_mean(
+        torch.tensor([loss_sum / max(1, count)], device=device), world_size
+    )
     local_miou = torch.tensor([float(iou_metric.show())], device=device)
     miou = float(_distributed_mean(local_miou, world_size).item())
     return float(mean_loss.item()), miou
-
-
-def export_predictions(
-    *,
-    model: torch.nn.Module,
-    loader,
-    device: torch.device,
-    autocast_dtype: torch.dtype,
-    output_dir: Path,
-    num_classes: int,
-    eval_params: dict,
-) -> None:
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    autocast_device = "cuda" if device.type == "cuda" else "cpu"
-    model.eval()
-    with torch.no_grad():
-        for batch in loader:
-            images, _masks, sample_indices, orig_sizes, *rest = batch
-            file_names = rest[0] if rest else None
-            images = images.to(device, non_blocking=True)
-            batch_size = images.shape[0]
-            for b in range(batch_size):
-                target_h = int(orig_sizes[b][0].item())
-                target_w = int(orig_sizes[b][1].item())
-                if target_h <= 0 or target_w <= 0:
-                    target_h, target_w = images.shape[-2:]
-                logits = _run_full_image_inference(
-                    model,
-                    images[b],
-                    eval_params=eval_params,
-                    num_classes=num_classes,
-                    device=device,
-                    autocast_dtype=autocast_dtype,
-                    target_size=(target_h, target_w),
-                )
-                pred_mask = logits.argmax(dim=1).squeeze(0).float()
-                mask_tensor = torch.clamp(pred_mask, 0.0, 1.0)
-                mask_tensor = (mask_tensor * 255).to(torch.uint8).cpu().numpy()
-                if file_names:
-                    stem = str(file_names[b])
-                else:
-                    if isinstance(sample_indices, torch.Tensor):
-                        stem = f"sample_{int(sample_indices[b].item())}"
-                    else:
-                        stem = f"sample_{int(sample_indices[b])}"
-                out_path = output_dir / f"{stem}.png"
-                Image.fromarray(mask_tensor, mode="L").save(out_path)
 
 
 def build_optimizer(model: torch.nn.Module, train_cfg: dict) -> torch.optim.Optimizer:
@@ -279,12 +260,20 @@ def build_optimizer(model: torch.nn.Module, train_cfg: dict) -> torch.optim.Opti
     return AdamW(
         params,
         lr=float(train_cfg.get("lr", 1e-4)),
-        betas=(float(train_cfg.get("beta1", 0.9)), float(train_cfg.get("beta2", 0.999))),
+        betas=(
+            float(train_cfg.get("beta1", 0.9)),
+            float(train_cfg.get("beta2", 0.999)),
+        ),
         weight_decay=float(train_cfg.get("weight_decay", 0.05)),
     )
 
 
-def build_scheduler(optimizer: torch.optim.Optimizer, train_cfg: dict, steps_per_epoch: int, total_epochs: int):
+def build_scheduler(
+    optimizer: torch.optim.Optimizer,
+    train_cfg: dict,
+    steps_per_epoch: int,
+    total_epochs: int,
+):
     sched_cfg = train_cfg.get("scheduler", {}) or {}
     sched_type = str(sched_cfg.get("type", "")).strip().lower()
     if sched_type in {"", "none", "null"}:
@@ -315,7 +304,11 @@ def build_scheduler(optimizer: torch.optim.Optimizer, train_cfg: dict, steps_per
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
         return scheduler, "step"
     if sched_type == "cosine":
-        t_max = total_epochs if interval == "epoch" else max(1, steps_per_epoch * total_epochs)
+        t_max = (
+            total_epochs
+            if interval == "epoch"
+            else max(1, steps_per_epoch * total_epochs)
+        )
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
             T_max=t_max,
@@ -334,6 +327,7 @@ def build_scheduler(optimizer: torch.optim.Optimizer, train_cfg: dict, steps_per
         return scheduler, "epoch"
     raise ValueError(f"未知的 scheduler 类型: {sched_type}")
 
+
 def save_checkpoint(
     path: Path,
     model: torch.nn.Module,
@@ -350,6 +344,7 @@ def save_checkpoint(
     }
     torch.save(state, path)
 
+
 def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
@@ -361,7 +356,9 @@ def main() -> None:
 
     device, rank, world_size, local_rank, distributed = _setup_device_and_distributed()
     mask2former_config = build_mask2former_config(cfg)
-    feature_order = cfg.get("mask2former", {}).get("feature_order", ["1", "2", "3", "4"])
+    feature_order = cfg.get("mask2former", {}).get(
+        "feature_order", ["1", "2", "3", "4"]
+    )
 
     logger = init_training_logger(
         rank=rank,
@@ -389,10 +386,16 @@ def main() -> None:
     model = DinoMask2Former(adapter, mask2former_config, feature_order).to(device)
     if rank == 0:
         unwrapped = _unwrap(model)
-        backbone_params = sum(p.numel() for p in unwrapped.feature_extractor.parameters())
+        backbone_params = sum(
+            p.numel() for p in unwrapped.feature_extractor.parameters()
+        )
         head_params = sum(
             p.numel()
-            for module in (unwrapped.pixel_decoder, unwrapped.transformer_module, unwrapped.class_predictor)
+            for module in (
+                unwrapped.pixel_decoder,
+                unwrapped.transformer_module,
+                unwrapped.class_predictor,
+            )
             for p in module.parameters()
         )
         total_params = backbone_params + head_params
@@ -424,11 +427,15 @@ def main() -> None:
     epochs = int(train_cfg.get("epochs", 30))
     grad_accum_steps = max(1, int(train_cfg.get("grad_accum_steps", 1)))
     steps_per_epoch = math.ceil(len(train_loader) / grad_accum_steps)
-    scheduler, scheduler_interval = build_scheduler(optimizer, train_cfg, steps_per_epoch, epochs)
+    scheduler, scheduler_interval = build_scheduler(
+        optimizer, train_cfg, steps_per_epoch, epochs
+    )
 
     autocast_dtype = _as_dtype(train_cfg.get("autocast_dtype", "bfloat16"), device.type)
     amp_device = "cuda" if device.type == "cuda" else "cpu"
-    scaler = amp.GradScaler(amp_device, enabled=(device.type == "cuda" and autocast_dtype == torch.float16))
+    scaler = amp.GradScaler(
+        amp_device, enabled=(device.type == "cuda" and autocast_dtype == torch.float16)
+    )
 
     eval_interval = max(1, int(train_cfg.get("eval_interval", 1)))
     save_after_epoch = max(1, int(train_cfg.get("save_after_epoch", 90)))
@@ -444,7 +451,11 @@ def main() -> None:
 
     last_epoch = start_epoch - 1
     for epoch in range(start_epoch, epochs):
-        if distributed and hasattr(train_loader, "sampler") and train_loader.sampler is not None:
+        if (
+            distributed
+            and hasattr(train_loader, "sampler")
+            and train_loader.sampler is not None
+        ):
             train_loader.sampler.set_epoch(epoch)
         global_step, train_loss, train_metrics = train_one_epoch(
             model=model,
@@ -496,26 +507,34 @@ def main() -> None:
                     f"[Epoch {epoch}] train_loss={train_loss:.4f} eval_loss={eval_loss:.4f} mIoU={miou:.4f}"
                 )
             else:
-                logger.log_message(f"[Epoch {epoch}] train_loss={train_loss:.4f} (跳过评估 interval={eval_interval})")
+                logger.log_message(
+                    f"[Epoch {epoch}] train_loss={train_loss:.4f} (跳过评估 interval={eval_interval})"
+                )
             if eval_results is not None:
                 _, miou = eval_results
                 if miou > best_miou:
                     best_miou = miou
                     if (epoch + 1) >= save_after_epoch:
-                        save_checkpoint(best_ckpt_path, model, epoch, global_step, best_miou)
+                        save_checkpoint(
+                            best_ckpt_path, model, epoch, global_step, best_miou
+                        )
                         logger.log_message(
                             f"新的最佳 mIoU={best_miou:.4f}，已更新最佳 checkpoint (epoch {epoch})."
                         )
                     else:
-                        logger.log_message(
-                            f"新的最佳 mIoU={best_miou:.4f}"
-                        )
+                        logger.log_message(f"新的最佳 mIoU={best_miou:.4f}")
         last_epoch = epoch
         if distributed:
             dist.barrier()
 
     if rank == 0:
-        save_checkpoint(last_ckpt_path, model, last_epoch if last_epoch >= 0 else epochs - 1, global_step, best_miou)
+        save_checkpoint(
+            last_ckpt_path,
+            model,
+            last_epoch if last_epoch >= 0 else epochs - 1,
+            global_step,
+            best_miou,
+        )
         logger.log_message(f"最后一个 epoch 的权重已保存至: {last_ckpt_path}")
 
     pred_dir_path = Path(pred_dir_setting)

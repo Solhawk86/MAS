@@ -10,14 +10,19 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import yaml
-from dinov3.distributed import enable as enable_distributed, is_enabled as dist_is_enabled
+from dinov3.distributed import (
+    enable as enable_distributed,
+    is_enabled as dist_is_enabled,
+)
 from torch.utils.tensorboard import SummaryWriter
 
 
 CfgLike = Union[str, Mapping[str, Any]]
 
 
-def prepare_dinov3_cfg(cfg: CfgLike, *, backbone_type: str | None = None) -> dict[str, Any]:
+def prepare_dinov3_cfg(
+    cfg: CfgLike, *, backbone_type: str | None = None
+) -> dict[str, Any]:
     """
     读取并规范化 DINOv3 所需的配置。
 
@@ -61,10 +66,12 @@ def dict_to_namespace(data: Any) -> Any:
         return [dict_to_namespace(v) for v in data]
     return data
 
+
 def load_config(cfg_path: str = "config_eval.yaml"):
     with open(cfg_path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
-    
+
+
 def _load_cfg_as_dict(cfg: CfgLike) -> dict[str, Any]:
     if isinstance(cfg, str):
         with open(cfg, "r", encoding="utf-8") as f:
@@ -105,7 +112,9 @@ def _normalize_student_cfg(student_cfg: MutableMapping[str, Any]) -> None:
 
     rope_norm = student_cfg.get("pos_embed_rope_normalize_coords")
     if isinstance(rope_norm, bool):
-        student_cfg["pos_embed_rope_normalize_coords"] = "separate" if rope_norm else "min"
+        student_cfg["pos_embed_rope_normalize_coords"] = (
+            "separate" if rope_norm else "min"
+        )
     elif rope_norm is None:
         student_cfg["pos_embed_rope_normalize_coords"] = "separate"
 
@@ -208,7 +217,7 @@ def _setup_device_and_distributed() -> tuple[torch.device, int, int, int, bool]:
         if torch.distributed.is_available() and not torch.distributed.is_initialized():
             backend = "nccl" if device.type == "cuda" else "gloo"
             os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-            os.environ.setdefault("MASTER_PORT", "29500")
+            os.environ.setdefault("MASTER_PORT", "29501")
             torch.distributed.init_process_group(backend=backend, rank=0, world_size=1)
             dist.barrier()
         return device, rank, world_size, local_rank, distributed
@@ -265,7 +274,10 @@ def _ensure_dir(path: str | Path) -> None:
         return
     Path(path).mkdir(parents=True, exist_ok=True)
 
-def create_tensorboard_writer(log_dir: str | Path | None, rank: int, enabled: bool = True) -> SummaryWriter | None:
+
+def create_tensorboard_writer(
+    log_dir: str | Path | None, rank: int, enabled: bool = True
+) -> SummaryWriter | None:
     if not enabled or rank != 0:
         return None
     default_dir = Path("runs")
@@ -273,14 +285,22 @@ def create_tensorboard_writer(log_dir: str | Path | None, rank: int, enabled: bo
     log_root.mkdir(parents=True, exist_ok=True)
     return SummaryWriter(log_dir=str(log_root))
 
-def tensorboard_log_scalars(writer: SummaryWriter | None, step: int, scalars: dict[str, float]) -> None:
+
+def tensorboard_log_scalars(
+    writer: SummaryWriter | None, step: int, scalars: dict[str, float]
+) -> None:
     if writer is None:
         return
     for key, value in scalars.items():
         writer.add_scalar(key, value, step)
     writer.flush()
 
-def _tensor_to_uint8_image(image_tensor: Optional[torch.Tensor], mean_tensor: torch.Tensor, std_tensor: torch.Tensor):
+
+def _tensor_to_uint8_image(
+    image_tensor: Optional[torch.Tensor],
+    mean_tensor: torch.Tensor,
+    std_tensor: torch.Tensor,
+):
     if image_tensor is None:
         return None
     image = image_tensor.detach().clone()

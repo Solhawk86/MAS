@@ -1,16 +1,23 @@
-
 import torch
 
 from transformers import Mask2FormerConfig
-from MAS.mask2former.hf_pixel_decoder_custom import DinoCompatibleMask2FormerPixelDecoder
-from typing import Sequence
-from transformers.models.mask2former.modeling_mask2former import (
-    Mask2FormerLoss,
-    Mask2FormerTransformerModule,
+from MAS.mask2former.hf_pixel_decoder_custom import (
+    DinoCompatibleMask2FormerPixelDecoder,
 )
+from typing import Sequence
+from transformers.models.mask2former.modeling_mask2former import Mask2FormerLoss
+
+from MAS.loss import LaplacianClarity, QueryDepthConsistencyLoss
+from MAS.mask2former.depth_transformer import DepthAwareMask2FormerTransformerModule
+
 
 class DinoMask2Former(torch.nn.Module):
-    def __init__(self, feature_extractor: torch.nn.Module, config: Mask2FormerConfig, feature_order: Sequence[str]):
+    def __init__(
+        self,
+        feature_extractor: torch.nn.Module,
+        config: Mask2FormerConfig,
+        feature_order: Sequence[str],
+    ):
         super().__init__()
         self.feature_extractor = feature_extractor
         self.feature_order = list(feature_order)
@@ -22,7 +29,10 @@ class DinoMask2Former(torch.nn.Module):
             config,
             feature_channels=[int(embed_dim)] * len(self.feature_order),
         )
-        self.transformer_module = Mask2FormerTransformerModule(in_features=config.feature_size, config=config)
+        self.transformer_module = DepthAwareMask2FormerTransformerModule(
+            in_features=config.feature_size,
+            config=config,
+        )
         self.class_predictor = torch.nn.Linear(config.hidden_dim, config.num_labels + 1)
         self.loss_weights = {
             "loss_cross_entropy": config.class_weight,
@@ -38,6 +48,36 @@ class DinoMask2Former(torch.nn.Module):
         self.feature_extractor.requires_grad_(False)
         self._logged_feature_info = False
 
+        # depth-aware queries 的额外监督配置
+        self.depth_loss_weight = float(getattr(config, "depth_loss_weight"))
+        depth_groups = int(getattr(config, "depth_num_groups", 0) or 0)
+        depth_div_weight = float(getattr(config, "depth_diversity_weight"))
+        self.depth_loss_enabled = self.depth_loss_weight > 0 and depth_groups > 0
+        if self.depth_loss_enabled:
+            self.depth_clarity = LaplacianClarity()
+            self.depth_consistency_loss = QueryDepthConsistencyLoss(
+                num_queries=config.num_queries,
+                hidden_dim=config.hidden_dim,
+                num_depth=depth_groups,
+                div_loss_weight=depth_div_weight,
+            )
+        else:
+            self.depth_clarity = None
+            self.depth_consistency_loss = None
+
+        mean = getattr(config, "image_normalize_mean", None)
+        std = getattr(config, "image_normalize_std", None)
+        self._image_mean: torch.Tensor | None = None
+        self._image_std: torch.Tensor | None = None
+        self._image_divisor = 255.0  # 恢复 0~255 归一化的尺度
+        self._images_are_255 = False
+        if mean and std and len(mean) == len(std):
+            self._image_mean = torch.tensor(mean, dtype=torch.float32).view(1, -1, 1, 1)
+            self._image_std = torch.tensor(std, dtype=torch.float32).view(1, -1, 1, 1)
+            self._images_are_255 = any(abs(m) > 1.0 for m in mean) or any(
+                abs(s) > 1.0 for s in std
+            )
+
     def forward(
         self,
         pixel_values: torch.Tensor,
@@ -46,9 +86,15 @@ class DinoMask2Former(torch.nn.Module):
     ):
         with torch.no_grad():
             features_dict = self.feature_extractor(pixel_values)
-        features = [features_dict[key] for key in self.feature_order if key in features_dict]
+        features = [
+            features_dict[key] for key in self.feature_order if key in features_dict
+        ]
         if not self._logged_feature_info:
-            info = ", ".join(f"{key}:{tuple(features_dict[key].shape)}" for key in self.feature_order if key in features_dict)
+            info = ", ".join(
+                f"{key}:{tuple(features_dict[key].shape)}"
+                for key in self.feature_order
+                if key in features_dict
+            )
             print(f"[DINOv3 Adapter Features] {info}")
             self._logged_feature_info = True
         decoder_out = self.pixel_decoder(
@@ -77,6 +123,7 @@ class DinoMask2Former(torch.nn.Module):
         ]
         loss = None
         loss_dict: dict[str, torch.Tensor] = {}
+        raw_loss_dict: dict[str, torch.Tensor] = {}
         if mask_labels is not None and class_labels is not None:
             loss_dict = self.criterion(
                 masks_queries_logits=masks_queries[-1],
@@ -85,19 +132,78 @@ class DinoMask2Former(torch.nn.Module):
                 class_labels=class_labels,
                 auxiliary_predictions=aux,
             )
-            weighted: dict[str, torch.Tensor] = {}
-            for key, value in loss_dict.items():
-                weight = 1.0
-                for base_key, base_weight in self.loss_weights.items():
-                    if key.startswith(base_key):
-                        weight = base_weight
-                        break
-                weighted[key] = value * weight
-            loss_dict = weighted
-            loss = sum(weighted.values())
+            raw_loss_dict = {k: v.detach() for k, v in loss_dict.items()}
+            loss_dict = self._weight_detection_losses(loss_dict)
+            loss = sum(loss_dict.values())
+
+            if self.depth_loss_enabled:
+                depth_loss_raw = self._compute_depth_loss(
+                    pixel_values,
+                    masks_queries[-1],
+                    transformer_out.get("depth_latent"),
+                    transformer_out.get("depth_ids"),
+                )
+                if depth_loss_raw is not None:
+                    raw_loss_dict["depth_loss"] = depth_loss_raw.detach()
+                    weighted_depth = depth_loss_raw * self.depth_loss_weight
+                    loss = loss + weighted_depth
+                    loss_dict["depth_loss"] = weighted_depth
         return {
             "loss": loss,
             "loss_dict": loss_dict,
+            "raw_loss_dict": raw_loss_dict,
             "class_queries_logits": class_queries[-1],
             "masks_queries_logits": masks_queries[-1],
         }
+
+    def _weight_detection_losses(
+        self, raw_losses: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """将 HF loss 名称映射到 config 中的权重。"""
+        weighted: dict[str, torch.Tensor] = {}
+        for key, value in raw_losses.items():
+            coeff = next(
+                (
+                    base_weight
+                    for base_key, base_weight in self.loss_weights.items()
+                    if key.startswith(base_key)
+                ),
+                1.0,
+            )
+            weighted[key] = value * coeff
+        return weighted
+
+    def _recover_images(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        images = pixel_values.detach()
+        if self._image_mean is not None and self._image_std is not None:
+            # 反归一化回原图分布
+            mean = self._image_mean.to(images.device)
+            std = self._image_std.to(images.device)
+            images = images * std + mean
+        if self._images_are_255:
+            images = images / self._image_divisor
+        return images.clamp(0.0, 1.0)
+
+    def _compute_depth_loss(
+        self,
+        pixel_values: torch.Tensor,
+        mask_logits: torch.Tensor,
+        depth_latent: torch.Tensor | None,
+        depth_ids: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        if (
+            not self.depth_loss_enabled
+            or self.depth_consistency_loss is None
+            or self.depth_clarity is None
+            or depth_latent is None
+            or depth_ids is None
+        ):
+            return None
+        clarity_map = self.depth_clarity(self._recover_images(pixel_values))
+        mask_probs = mask_logits.sigmoid()
+        return self.depth_consistency_loss(
+            depth_latent=depth_latent,
+            masks=mask_probs,
+            clarity_map=clarity_map,
+            depth_ids=depth_ids,
+        )

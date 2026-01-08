@@ -30,7 +30,9 @@ class cal_dice:
         y_true_f = gt.flatten()
         y_pred_f = pred.flatten()
         intersection = np.sum(y_true_f * y_pred_f)
-        score = (2.0 * intersection + smooth) / (np.sum(y_true_f) + np.sum(y_pred_f) + smooth)
+        score = (2.0 * intersection + smooth) / (
+            np.sum(y_true_f) + np.sum(y_pred_f) + smooth
+        )
         self.prediction.append(score)
 
     def show(self):
@@ -163,13 +165,17 @@ class cal_sm:
             return 1 - np.mean(pred)
         if y == 1:
             return np.mean(pred)
-        return self.alpha * self.object(pred, gt) + (1 - self.alpha) * self.region(pred, gt)
+        return self.alpha * self.object(pred, gt) + (1 - self.alpha) * self.region(
+            pred, gt
+        )
 
     def object(self, pred, gt):
         fg = pred * gt
         bg = (1 - pred) * (1 - gt)
         u = np.mean(gt)
-        return u * self.s_object(fg, gt) + (1 - u) * self.s_object(bg, np.logical_not(gt))
+        return u * self.s_object(fg, gt) + (1 - u) * self.s_object(
+            bg, np.logical_not(gt)
+        )
 
     def s_object(self, in1, in2):
         if not np.any(in2):
@@ -256,7 +262,11 @@ class cal_em:
         mu_GT = np.mean(dGT)
         align_FM = dFM - mu_FM
         align_GT = dGT - mu_GT
-        return 2 * (align_GT * align_FM) / (align_GT * align_GT + align_FM * align_FM + 1e-8)
+        return (
+            2
+            * (align_GT * align_FM)
+            / (align_GT * align_GT + align_FM * align_FM + 1e-8)
+        )
 
     def EnhancedAlignmentTerm(self, align_Matrix):
         return np.power(align_Matrix + 1, 2) / 4
@@ -329,12 +339,19 @@ def _normalize_gt(arr: np.ndarray) -> np.ndarray:
 
 
 def _matching_files(pred_dir: Path, gt_dir: Path) -> list[tuple[Path, Path]]:
-    gt_files = sorted([p for p in gt_dir.iterdir() if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp"}])
+    gt_files = sorted(
+        [
+            p
+            for p in gt_dir.iterdir()
+            if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp"}
+        ]
+    )
     matches: list[tuple[Path, Path]] = []
     for gt_path in gt_files:
         stem = gt_path.stem
         candidates = [
-            pred_dir / f"{stem}{suffix}" for suffix in (gt_path.suffix, ".png", ".jpg", ".bmp")
+            pred_dir / f"{stem}{suffix}"
+            for suffix in (gt_path.suffix, ".png", ".jpg", ".bmp")
         ]
         pred_path = next((c for c in candidates if c.exists()), None)
         if pred_path is not None:
@@ -342,7 +359,9 @@ def _matching_files(pred_dir: Path, gt_dir: Path) -> list[tuple[Path, Path]]:
     return matches
 
 
-def evaluate_prediction_directory(pred_dir: Path | str, gt_dir: Path | str) -> dict[str, float]:
+def evaluate_prediction_directory(
+    pred_dir: Path | str, gt_dir: Path | str
+) -> dict[str, float]:
     pred_dir = Path(pred_dir).expanduser()
     gt_dir = Path(gt_dir).expanduser()
     if not pred_dir.is_dir() or not gt_dir.is_dir():
@@ -366,7 +385,9 @@ def evaluate_prediction_directory(pred_dir: Path | str, gt_dir: Path | str) -> d
         pred = _load_mask(pred_path)
         gt = _load_mask(gt_path)
         if pred.shape != gt.shape:
-            pred_img = Image.fromarray(pred).resize(gt.shape[::-1], resample=Image.BILINEAR)
+            pred_img = Image.fromarray(pred).resize(
+                gt.shape[::-1], resample=Image.BILINEAR
+            )
             pred = np.array(pred_img, dtype=np.float32)
         pred_norm = _normalize_prediction(pred)
         gt_norm = _normalize_gt(gt)
