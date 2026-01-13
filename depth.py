@@ -3,7 +3,7 @@ import torch.nn as nn
 
 
 class LearnableDepthQueryEmbedding(nn.Module):
-    """Mask2Former query embedding + 3 组深度向量."""
+    """Mask2Former query embedding + per-query depth latents grouped by depth ids."""
 
     def __init__(self, num_queries: int, hidden_dim: int, num_depth: int = 3):
         super().__init__()
@@ -16,7 +16,7 @@ class LearnableDepthQueryEmbedding(nn.Module):
         self.num_depth = num_depth
 
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
-        self.group_depth_embed = nn.Embedding(num_depth, hidden_dim)
+        self.depth_embed = nn.Embedding(num_queries, hidden_dim)
         self.depth_scale = nn.Parameter(torch.tensor(0.1))
 
         self._reset_parameters()
@@ -24,8 +24,8 @@ class LearnableDepthQueryEmbedding(nn.Module):
         self.register_buffer("depth_ids", depth_ids, persistent=False)
 
     def _reset_parameters(self):
-        nn.init.zeros_(self.group_depth_embed.weight)
         nn.init.uniform_(self.query_embed.weight)
+        nn.init.zeros_(self.depth_embed.weight)
 
     @staticmethod
     def _build_depth_ids(num_queries: int, num_depth: int) -> torch.Tensor:
@@ -38,7 +38,7 @@ class LearnableDepthQueryEmbedding(nn.Module):
         return ids
 
     def _depth_latent(self) -> torch.Tensor:
-        return self.group_depth_embed(self.depth_ids)
+        return self.depth_embed.weight
 
     def _query_latent(self) -> torch.Tensor:
         return self.query_embed.weight + self.depth_scale * self._depth_latent()

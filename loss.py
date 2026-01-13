@@ -1,7 +1,12 @@
 # loss.py
+import argparse
+from pathlib import Path
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from PIL import Image
 
 from dinov3.loss.dino_clstoken_loss import DINOLoss
 from dinov3.loss.ibot_patch_loss import iBOTPatchLoss
@@ -216,6 +221,27 @@ class QueryDepthConsistencyLoss(nn.Module):
                 loss_div += (E_avg_depth[i] - E_avg_depth[j]) ** 2
 
         # 总 loss
-        loss = loss_depth + self.div_loss_weight * loss_div
+        loss = loss_depth - self.div_loss_weight * loss_div
 
         return loss
+
+
+def _demo_laplacian_clarity(image_path: str, output_path: str) -> None:
+    """将输入图像通过 LaplacianClarity 生成 0-255 的可视化 PNG。"""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    image = Image.open(Path(image_path)).convert("RGB")
+    img_array = np.asarray(image, dtype=np.float32) / 255.0
+    img_tensor = torch.from_numpy(img_array).permute(2, 0, 1).unsqueeze(0).to(device)
+    clarity_map = LaplacianClarity().to(device)(img_tensor)
+    clarity_np = clarity_map.squeeze(0).squeeze(0).detach().cpu().numpy()
+    clarity_np = clarity_np / (clarity_np.max() + 1e-8)
+    clarity_img = (clarity_np * 255.0).clip(0, 255).astype(np.uint8)
+    Image.fromarray(clarity_img, mode="L").save(Path(output_path))
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="LaplacianClarity 可视化测试")
+    parser.add_argument("input", type=str, help="输入图像路径")
+    parser.add_argument("output", type=str, help="输出 PNG 路径")
+    args = parser.parse_args()
+    _demo_laplacian_clarity(args.input, args.output)

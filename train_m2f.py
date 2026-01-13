@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import argparse
 import math
+import random
 from collections import defaultdict
 from pathlib import Path
 import sys
+
+import numpy as np
 
 CURRENT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = CURRENT_DIR.parent
@@ -142,7 +145,16 @@ def train_one_epoch(
             raw_losses = outputs.get("raw_loss_dict") or {}
             raw_str = ""
             if raw_losses:
-                wanted = {k: raw_losses[k] for k in ("loss_mask", "loss_dice", "loss_cross_entropy", "depth_loss") if k in raw_losses}
+                wanted = {
+                    k: raw_losses[k]
+                    for k in (
+                        "loss_mask",
+                        "loss_dice",
+                        "loss_cross_entropy",
+                        "depth_loss",
+                    )
+                    if k in raw_losses
+                }
                 if wanted:
                     parts = []
                     for key, value in wanted.items():
@@ -259,12 +271,12 @@ def build_optimizer(model: torch.nn.Module, train_cfg: dict) -> torch.optim.Opti
         raise RuntimeError("未找到需要训练的参数")
     return AdamW(
         params,
-        lr=float(train_cfg.get("lr", 1e-4)),
+        lr=float(train_cfg["lr"]),
         betas=(
-            float(train_cfg.get("beta1", 0.9)),
-            float(train_cfg.get("beta2", 0.999)),
+            float(train_cfg["beta1"]),
+            float(train_cfg["beta2"]),
         ),
-        weight_decay=float(train_cfg.get("weight_decay", 0.05)),
+        weight_decay=float(train_cfg["weight_decay"]),
     )
 
 
@@ -274,16 +286,16 @@ def build_scheduler(
     steps_per_epoch: int,
     total_epochs: int,
 ):
-    sched_cfg = train_cfg.get("scheduler", {}) or {}
-    sched_type = str(sched_cfg.get("type", "")).strip().lower()
+    sched_cfg = train_cfg["scheduler"]
+    sched_type = str(sched_cfg["type"]).strip().lower()
     if sched_type in {"", "none", "null"}:
         sched_type = ""
-    interval = sched_cfg.get("interval", "epoch")
+    interval = sched_cfg["interval"]
     if not sched_type:
         return None, "step"
     if sched_type == "fractional_step_decay":
-        fractions = sched_cfg.get("fractions", [0.9, 0.95])
-        gamma = float(sched_cfg.get("decay_factor", 0.1))
+        fractions = sched_cfg["fractions"]
+        gamma = float(sched_cfg["decay_factor"])
         total_steps = max(1, steps_per_epoch * total_epochs)
         milestones: list[int] = []
         for frac in fractions:
@@ -312,17 +324,17 @@ def build_scheduler(
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
             T_max=t_max,
-            eta_min=float(sched_cfg.get("eta_min", 0.0)),
+            eta_min=float(sched_cfg["eta_min"]),
         )
         return scheduler, interval
     if sched_type == "multistep":
-        milestones = sched_cfg.get("decay_milestones", [0.9, 0.95])
+        milestones = sched_cfg["decay_milestones"]
         if all(0 < m < 1 for m in milestones):
             milestones = [int(total_epochs * m) for m in milestones]
         scheduler = torch.optim.lr_scheduler.MultiStepLR(
             optimizer,
             milestones=milestones,
-            gamma=float(sched_cfg.get("decay_factor", 0.1)),
+            gamma=float(sched_cfg["decay_factor"]),
         )
         return scheduler, "epoch"
     raise ValueError(f"未知的 scheduler 类型: {sched_type}")
@@ -348,36 +360,34 @@ def save_checkpoint(
 def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
-    train_cfg = cfg.get("training", {}) or {}
-    dataset_cfg = cfg.get("dataset", {}) or {}
-    weights_cfg = cfg.get("weights", {}) or {}
-    eval_cfg = cfg.get("evaluation", {}) or {}
+    train_cfg = cfg["training"]
+    dataset_cfg = cfg["dataset"]
+    weights_cfg = cfg["weights"]
+    eval_cfg = cfg["evaluation"]
     eval_inference_params = _resolve_eval_inference_params(dataset_cfg, eval_cfg)
 
     device, rank, world_size, local_rank, distributed = _setup_device_and_distributed()
     mask2former_config = build_mask2former_config(cfg)
-    feature_order = cfg.get("mask2former", {}).get(
-        "feature_order", ["1", "2", "3", "4"]
-    )
+    feature_order = cfg["mask2former"]["feature_order"]
 
     logger = init_training_logger(
         rank=rank,
         distributed=distributed,
-        tensorboard_enabled=bool(train_cfg.get("tensorboard_enabled", True)),
-        tensorboard_subdir=train_cfg.get("tensorboard_log_dir"),
-        checkpoint_subdir=train_cfg.get("checkpoint_dir"),
-        weights_root=weights_cfg.get("storage_dir"),
-        local_weights_root=None,
+        tensorboard_enabled=bool(train_cfg["tensorboard_enabled"]),
+        tensorboard_subdir=train_cfg["tensorboard_log_dir"],
+        checkpoint_subdir=train_cfg["checkpoint_dir"],
+        weights_root=weights_cfg["storage_dir"],
+        local_weights_root=weights_cfg["local_dir"],
     )
     if rank == 0:
         logger.log_config(cfg)
     best_ckpt_path = logger.checkpoint_dir / "best.pt"
     last_ckpt_path = logger.checkpoint_dir / "last.pt"
 
-    pred_dir_setting = eval_cfg.get("pred_dir", "predictions")
-    gt_dir_setting = eval_cfg.get("gt_dir") or dataset_cfg.get("val_masks")
+    pred_dir_setting = eval_cfg["pred_dir"]
+    gt_dir_setting = eval_cfg["gt_dir"]
     if gt_dir_setting is None:
-        raise ValueError("请在 config 中设置 evaluation.gt_dir 或 dataset.val_masks")
+        raise ValueError("请在 config 中设置 evaluation.gt_dir")
     gt_dir_path = Path(gt_dir_setting).expanduser()
 
     backbone = build_backbone(cfg, device)
@@ -424,30 +434,30 @@ def main() -> None:
         )
 
     optimizer = build_optimizer(model, train_cfg)
-    epochs = int(train_cfg.get("epochs", 30))
-    grad_accum_steps = max(1, int(train_cfg.get("grad_accum_steps", 1)))
+    epochs = int(train_cfg["epochs"])
+    grad_accum_steps = max(1, int(train_cfg["grad_accum_steps"]))
     steps_per_epoch = math.ceil(len(train_loader) / grad_accum_steps)
     scheduler, scheduler_interval = build_scheduler(
         optimizer, train_cfg, steps_per_epoch, epochs
     )
 
-    autocast_dtype = _as_dtype(train_cfg.get("autocast_dtype", "bfloat16"), device.type)
+    autocast_dtype = _as_dtype(train_cfg["autocast_dtype"], device.type)
     amp_device = "cuda" if device.type == "cuda" else "cpu"
     scaler = amp.GradScaler(
         amp_device, enabled=(device.type == "cuda" and autocast_dtype == torch.float16)
     )
 
-    eval_interval = max(1, int(train_cfg.get("eval_interval", 1)))
-    save_after_epoch = max(1, int(train_cfg.get("save_after_epoch", 90)))
+    eval_interval = max(1, int(train_cfg["eval_interval"]))
+    save_after_epoch = max(1, int(train_cfg["save_after_epoch"]))
 
     start_epoch = 0
     global_step = 0
     best_miou = 0.0
 
-    num_classes = int(dataset_cfg.get("num_classes", mask2former_config.num_labels))
-    ignore_index = int(dataset_cfg.get("ignore_index", mask2former_config.ignore_value))
-    log_interval = int(train_cfg.get("log_interval", 50))
-    grad_clip = float(train_cfg.get("grad_clip", train_cfg.get("grad_clip_norm", 0.0)))
+    num_classes = int(dataset_cfg["num_classes"])
+    ignore_index = int(dataset_cfg["ignore_index"])
+    log_interval = int(train_cfg["log_interval"])
+    grad_clip = float(train_cfg["grad_clip"])
 
     last_epoch = start_epoch - 1
     for epoch in range(start_epoch, epochs):

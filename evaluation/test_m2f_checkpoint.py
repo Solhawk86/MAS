@@ -44,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Evaluate a train_m2f checkpoint on a segmentation dataset"
     )
-    default_cfg = CURRENT_DIR / "evaluation" / "m2f_eval_example.yaml"
+    default_cfg = CURRENT_DIR / "configs" / "m2f_eval_example.yaml"
     parser.add_argument(
         "--config", type=str, default=str(default_cfg), help="YAML 配置文件路径"
     )

@@ -10,49 +10,45 @@ from dinov3.eval.segmentation.models import BackboneLayersSet
 def build_mask2former_config(
     cfg: dict, *, dataset_key: str | None = "dataset"
 ) -> Mask2FormerConfig:
-    dataset_cfg = cfg.get(dataset_key, {}) or {}
-    mask2former_cfg = cfg.get("mask2former", {}) or {}
-    num_classes = int(
-        dataset_cfg.get("num_classes", mask2former_cfg.get("num_classes", 2))
+    dataset_cfg = cfg[dataset_key] if dataset_key is not None else {}
+    mask2former_cfg = cfg["mask2former"]
+    num_classes = int(dataset_cfg["num_classes"]) if dataset_cfg else int(
+        mask2former_cfg["num_classes"]
     )
-    ignore_value = int(
-        dataset_cfg.get("ignore_index", mask2former_cfg.get("ignore_value", -1))
+    ignore_value = int(dataset_cfg["ignore_index"]) if dataset_cfg else int(
+        mask2former_cfg["ignore_value"]
     )
-    hidden_dim = int(mask2former_cfg.get("hidden_dim", 256))
-    ffn_dim = int(mask2former_cfg.get("ffn_dim", 2048))
+    hidden_dim = int(mask2former_cfg["hidden_dim"])
+    ffn_dim = int(mask2former_cfg["ffn_dim"])
     config = Mask2FormerConfig(
-        feature_size=int(mask2former_cfg.get("feature_size", hidden_dim)),
-        mask_feature_size=int(mask2former_cfg.get("mask_feature_size", hidden_dim)),
+        feature_size=int(mask2former_cfg["feature_size"]),
+        mask_feature_size=int(mask2former_cfg["mask_feature_size"]),
         hidden_dim=hidden_dim,
         encoder_feedforward_dim=ffn_dim,
-        encoder_layers=int(mask2former_cfg.get("encoder_layers", 6)),
-        decoder_layers=int(mask2former_cfg.get("decoder_layers", 9)),
-        num_attention_heads=int(mask2former_cfg.get("num_heads", 8)),
+        encoder_layers=int(mask2former_cfg["encoder_layers"]),
+        decoder_layers=int(mask2former_cfg["decoder_layers"]),
+        num_attention_heads=int(mask2former_cfg["num_heads"]),
         dim_feedforward=ffn_dim,
-        dropout=float(mask2former_cfg.get("dropout", 0)),
-        pre_norm=bool(mask2former_cfg.get("pre_norm", False)),
-        enforce_input_projection=bool(
-            mask2former_cfg.get("enforce_input_projection", False)
-        ),
-        common_stride=int(mask2former_cfg.get("common_stride", 4)),
-        num_queries=int(mask2former_cfg.get("num_queries", 100)),
-        no_object_weight=float(mask2former_cfg.get("no_object_weight", 0.1)),
-        class_weight=float(mask2former_cfg.get("class_weight")),
-        mask_weight=float(mask2former_cfg.get("mask_weight")),
-        dice_weight=float(mask2former_cfg.get("dice_weight")),
-        train_num_points=int(mask2former_cfg.get("train_num_points")),
-        oversample_ratio=float(mask2former_cfg.get("oversample_ratio", 3.0)),
-        importance_sample_ratio=float(
-            mask2former_cfg.get("importance_sample_ratio", 0.75)
-        ),
-        feature_strides=list(mask2former_cfg.get("feature_strides", [4, 8, 16, 32])),
+        dropout=float(mask2former_cfg["dropout"]),
+        pre_norm=bool(mask2former_cfg["pre_norm"]),
+        enforce_input_projection=bool(mask2former_cfg["enforce_input_projection"]),
+        common_stride=int(mask2former_cfg["common_stride"]),
+        num_queries=int(mask2former_cfg["num_queries"]),
+        no_object_weight=float(mask2former_cfg["no_object_weight"]),
+        class_weight=float(mask2former_cfg["class_weight"]),
+        mask_weight=float(mask2former_cfg["mask_weight"]),
+        dice_weight=float(mask2former_cfg["dice_weight"]),
+        train_num_points=int(mask2former_cfg["train_num_points"]),
+        oversample_ratio=float(mask2former_cfg["oversample_ratio"]),
+        importance_sample_ratio=float(mask2former_cfg["importance_sample_ratio"]),
+        feature_strides=list(mask2former_cfg["feature_strides"]),
         num_labels=num_classes,
         ignore_value=ignore_value,
         use_auxiliary_loss=True,
         output_auxiliary_logits=True,
     )
 
-    depth_groups = int(mask2former_cfg.get("depth_num_groups", 3))
+    depth_groups = int(mask2former_cfg["depth_num_groups"])
     if depth_groups <= 0:
         raise ValueError("depth_num_groups 必须大于0")
     if config.num_queries % depth_groups != 0:
@@ -66,14 +62,12 @@ def build_mask2former_config(
         raise ValueError("当前实验要求将 query 分成 3 组且每组 20 个")
 
     config.depth_num_groups = depth_groups
-    config.depth_loss_weight = float(mask2former_cfg.get("depth_loss_weight", 0.2))
-    config.depth_diversity_weight = float(
-        mask2former_cfg.get("depth_diversity_weight", 0.1)
-    )
+    config.depth_loss_weight = float(mask2former_cfg["depth_loss_weight"])
+    config.depth_diversity_weight = float(mask2former_cfg["depth_diversity_weight"])
 
-    transforms_cfg = dataset_cfg.get("transforms", {}) if dataset_cfg else {}
-    mean = transforms_cfg.get("mean")
-    std = transforms_cfg.get("std")
+    transforms_cfg = dataset_cfg["transforms"] if dataset_cfg else {}
+    mean = transforms_cfg["mean"] if transforms_cfg else None
+    std = transforms_cfg["std"] if transforms_cfg else None
     if mean and std and len(mean) == len(std):
         config.image_normalize_mean = list(mean)
         config.image_normalize_std = list(std)

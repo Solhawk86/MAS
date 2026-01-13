@@ -50,7 +50,7 @@ class DinoMask2Former(torch.nn.Module):
 
         # depth-aware queries 的额外监督配置
         self.depth_loss_weight = float(getattr(config, "depth_loss_weight"))
-        depth_groups = int(getattr(config, "depth_num_groups", 0) or 0)
+        depth_groups = int(getattr(config, "depth_num_groups"))
         depth_div_weight = float(getattr(config, "depth_diversity_weight"))
         self.depth_loss_enabled = self.depth_loss_weight > 0 and depth_groups > 0
         if self.depth_loss_enabled:
