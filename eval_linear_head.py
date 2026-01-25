@@ -10,9 +10,6 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import sys
 
-from pathlib import Path
-
-sys.path.append("/home/yangyan/hong/dinov3")
 # 确保可以以包形式导入 MAS.*
 _CWD = Path(__file__).resolve().parent
 _PROJECT_ROOT = _CWD.parent
@@ -44,7 +41,6 @@ from dinov3.eval.segmentation.config import (
     TrainTransformConfig,
     EvalTransformConfig,
 )
-from dinov3.eval.segmentation.eval import RESULTS_FILENAME
 from dinov3.eval.segmentation.loss import MultiSegmentationLoss
 from dinov3.eval.segmentation.models import build_segmentation_decoder
 from dinov3.eval.segmentation.schedulers import build_scheduler
@@ -57,6 +53,7 @@ warnings.filterwarnings("ignore", message=".*weights_only=False.*")
 
 
 logger = logging.getLogger("mas.seg_eval")
+RESULTS_FILENAME = "results-semantic-segmentation.csv"
 
 
 def init_distributed_mode():
