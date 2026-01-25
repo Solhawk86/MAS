@@ -12,11 +12,15 @@ def build_mask2former_config(
 ) -> Mask2FormerConfig:
     dataset_cfg = cfg[dataset_key] if dataset_key is not None else {}
     mask2former_cfg = cfg["mask2former"]
-    num_classes = int(dataset_cfg["num_classes"]) if dataset_cfg else int(
-        mask2former_cfg["num_classes"]
+    num_classes = (
+        int(dataset_cfg["num_classes"])
+        if dataset_cfg
+        else int(mask2former_cfg["num_classes"])
     )
-    ignore_value = int(dataset_cfg["ignore_index"]) if dataset_cfg else int(
-        mask2former_cfg["ignore_value"]
+    ignore_value = (
+        int(dataset_cfg["ignore_index"])
+        if dataset_cfg
+        else int(mask2former_cfg["ignore_value"])
     )
     hidden_dim = int(mask2former_cfg["hidden_dim"])
     ffn_dim = int(mask2former_cfg["ffn_dim"])
@@ -159,7 +163,7 @@ def _build_targets(
     *,
     num_classes: int,
     ignore_index: int,
-    min_instance_pixels: int = 8,
+    min_instance_pixels: int = 6,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     """
     将语义 mask 拆成 Mask2Former 的实例级标签。
@@ -193,6 +197,40 @@ def _build_targets(
             mask_labels.append(
                 torch.stack(bin_masks).to(mask.device, dtype=torch.float32)
             )
+            class_labels.append(
+                torch.as_tensor(cls_ids, device=mask.device, dtype=torch.long)
+            )
+        else:
+            h, w = mask.shape[-2:]
+            mask_labels.append(
+                torch.zeros((0, h, w), device=mask.device, dtype=torch.float32)
+            )
+            class_labels.append(torch.zeros((0,), device=mask.device, dtype=torch.long))
+    return mask_labels, class_labels
+
+
+def _build_targets_without_split(
+    masks: torch.Tensor,
+    *,
+    num_classes: int,
+    ignore_index: int,
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    mask_labels: list[torch.Tensor] = []
+    class_labels: list[torch.Tensor] = []
+    for mask in masks:
+        unique_vals = torch.unique(mask)
+        bin_masks: list[torch.Tensor] = []
+        cls_ids: list[int] = []
+        for value in unique_vals.tolist():
+            if value == ignore_index or value < 0 or value >= num_classes:
+                continue
+            binary = (mask == value).float()
+            if torch.count_nonzero(binary) == 0:
+                continue
+            bin_masks.append(binary)
+            cls_ids.append(int(value))
+        if bin_masks:
+            mask_labels.append(torch.stack(bin_masks))
             class_labels.append(
                 torch.as_tensor(cls_ids, device=mask.device, dtype=torch.long)
             )
