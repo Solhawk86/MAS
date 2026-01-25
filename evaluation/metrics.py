@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-import os
+import argparse
+import tempfile
 from pathlib import Path
-from typing import Iterable
 
 import numpy as np
 from PIL import Image
 from scipy import ndimage
 from scipy.ndimage import convolve, distance_transform_edt as bwdist
+
+RESIZE_SHAPE = (512, 512)
 
 
 class cal_mae:
@@ -359,6 +361,15 @@ def _matching_files(pred_dir: Path, gt_dir: Path) -> list[tuple[Path, Path]]:
     return matches
 
 
+def _resize_and_save(
+    src: Path, dst: Path, size: tuple[int, int] = RESIZE_SHAPE
+) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with Image.open(src) as img:
+        resized = img.convert("L").resize(size, resample=Image.BILINEAR)
+        resized.save(dst)
+
+
 def evaluate_prediction_directory(
     pred_dir: Path | str, gt_dir: Path | str
 ) -> dict[str, float]:
@@ -415,3 +426,49 @@ def evaluate_prediction_directory(
         "Acc": acc.show(),
     }
     return metrics
+
+
+def main() -> None:
+    """
+    输入预测目录和GT目录，打印各项指标
+    """
+    parser = argparse.ArgumentParser(
+        description="Evaluate prediction directory against ground-truth masks."
+    )
+    parser.add_argument("pred_dir", type=Path, help="Directory containing predictions.")
+    parser.add_argument("gt_dir", type=Path, help="Directory containing GT masks.")
+    args = parser.parse_args()
+
+    pred_dir = args.pred_dir.expanduser()
+    gt_dir = args.gt_dir.expanduser()
+    if not pred_dir.is_dir() or not gt_dir.is_dir():
+        raise FileNotFoundError(f"预测目录 {pred_dir} 或 GT 目录 {gt_dir} 不存在")
+
+    pairs = _matching_files(pred_dir, gt_dir)
+    if not pairs:
+        raise RuntimeError(f"在 {pred_dir} 下找不到与 {gt_dir} 对应的文件")
+
+    pred_temp: tempfile.TemporaryDirectory | None = None
+    gt_temp: tempfile.TemporaryDirectory | None = None
+    try:
+        pred_temp = tempfile.TemporaryDirectory(prefix="metrics_pred512_")
+        gt_temp = tempfile.TemporaryDirectory(prefix="metrics_gt512_")
+        pred_target = Path(pred_temp.name)
+        gt_target = Path(gt_temp.name)
+        for pred_path, gt_path in pairs:
+            _resize_and_save(pred_path, pred_target / pred_path.name)
+            _resize_and_save(gt_path, gt_target / gt_path.name)
+
+        metrics = evaluate_prediction_directory(pred_target, gt_target)
+    finally:
+        if pred_temp is not None:
+            pred_temp.cleanup()
+        if gt_temp is not None:
+            gt_temp.cleanup()
+
+    for name, value in metrics.items():
+        print(f"{name}: {value:.6f}")
+
+
+if __name__ == "__main__":
+    main()
