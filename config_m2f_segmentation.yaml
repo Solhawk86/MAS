@@ -1,0 +1,126 @@
+weights:
+  storage_dir: "/data/hong/weights"     # 大容量磁盘用于保存 checkpoints，可替换为绝对路径
+  local_dir: "./weights"   # 本地日志与 TensorBoard 目录，保持在当前工程下./weights
+
+student:
+  arch: "vit_large"
+  patch_size: 16
+  drop_path_rate: 0.0
+  pos_embed_rope_base: 10000
+  pos_embed_rope_min_period: null
+  pos_embed_rope_max_period: null
+  pos_embed_rope_normalize_coords: true
+  pos_embed_rope_shift_coords: false
+  pos_embed_rope_jitter_coords: false
+  pos_embed_rope_rescale_coords: false
+  qkv_bias: false
+  layerscale: 1e-5
+  norm_layer: "nn.LayerNorm"
+  ffn_layer: "nn.Linear"
+  ffn_bias: true
+  proj_bias: true
+  n_storage_tokens: 0
+  mask_k_bias: false
+  untie_cls_and_patch_norms: false
+  untie_global_and_local_cls_norm: false
+  fp8_enabled: false
+  fp8_filter: ""
+
+model:
+  backbone_out_layers: "FOUR_EVEN_INTERVALS"
+
+pretrained_weights: "/data/hong/weights/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
+finetuned_weights: "/data/hong/weights/20251208/student_backbone_step_100000.pth"
+
+train:
+  lora_layers: 24
+  lora_rank: 8
+  lora_alpha: 16.0
+  lora_dropout: 0.0
+
+backbone:
+  backbone_out_layers: "FOUR_EVEN_INTERVALS"
+
+dataset:
+  train_images: "/data/hong/data/USOD10k_merge/train/images"
+  train_masks: "/data/hong/data/USOD10k_merge/train/binary_masks"
+  val_images: "/data/hong/data/USOD10k_merge/test/images"
+  val_masks: "/data/hong/data/USOD10k_merge/test/binary_masks"
+  num_classes: 2
+  ignore_index: -1
+  transforms:
+    mean: [123.675, 116.28, 103.53]
+    std: [58.395, 57.12, 57.375]
+    train:
+      img_size: 512
+      random_img_size_ratio_range: [0.5, 2.0]
+      crop_size: [512, 512]
+      flip_prob: 0.5
+    eval:
+      img_size: 512
+      inference_mode: "slide"
+      stride: 341
+      use_tta: false
+      tta_ratios: [1.0]
+
+training:
+  device: "cuda"
+  batch_size: 1      
+  val_batch_size: 1
+  num_workers: 8
+  epochs: 100
+  grad_accum_steps: 1
+  eval_interval: 2
+  save_after_epoch: 60
+  lr: 0.0001        # prefer lr = 0.0005 ∗ batchsize/256
+  weight_decay: 0.05
+  beta1: 0.9
+  beta2: 0.999
+  grad_clip: 3.0
+  log_interval: 500
+  tensorboard_enabled: true
+  tensorboard_log_dir: null
+  checkpoint_dir: null
+  autocast_dtype: "bfloat16"
+  resume: null
+  log_trainable_params: true
+  scheduler:
+    type: "fractional_step_decay"
+    interval: "step"
+    fractions: [0.9, 0.95]
+    decay_factor: 0.1
+
+mask2former:
+  feature_order: ["1", "2", "3", "4"]
+  feature_strides: [4, 8, 16, 32]
+  hidden_dim: 256
+  ffn_dim: 2048
+  feature_size: 256
+  mask_feature_size: 256
+  dropout: 0.0
+  pre_norm: false
+  enforce_input_projection: false
+  common_stride: 4
+  num_queries: 60
+  depth_num_groups: 3
+  num_heads: 8
+  encoder_layers: 6
+  decoder_layers: 9
+  class_weight: 2
+  mask_weight: 5.0
+  dice_weight: 5.0
+  no_object_weight: 0.1
+  depth_loss_weight: 1
+  depth_diversity_weight: 0
+  train_num_points: 12544
+  oversample_ratio: 3.0
+  importance_sample_ratio: 0.75
+
+evaluation:
+  pred_dir: "predictions"
+  gt_dir: "/data/hong/data/USOD10k_merge/test/binary_masks"
+  inference_mode: "slide"
+  img_size: 512
+  stride: 341
+  use_tta: false
+  tta_ratios: [1.0]

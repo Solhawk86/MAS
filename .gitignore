@@ -30,6 +30,5 @@ piccheck.py
 compute_flops.py
 test_m2f_smoke.py
 piccheck.py
-**.yaml
 inspect_mask_instances.py
 batch_eval.py
