@@ -42,7 +42,11 @@ from MAS.utils import _distributed_mean, _setup_device_and_distributed, load_con
 from MAS.mask2former.utils import *
 from MAS.mask2former.model import DinoMask2Former
 from dinov3.eval.segmentation.models.backbone.dinov3_adapter import DINOv3_Adapter
-from MAS.mask2former.utils import _as_dtype, _build_targets
+from MAS.mask2former.utils import (
+    _as_dtype,
+    _build_targets,
+    _build_targets_without_split,
+)
 
 
 def parse_args() -> argparse.Namespace:
