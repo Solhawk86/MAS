@@ -24,7 +24,6 @@ seg_eval_runs
 m2f_feature
 hf_mask2former_runs
 caliou.py
-config_m2f_segmentation.yaml
 coco_masks_to_png.py
 plot_miou_curve.py
 piccheck.py
@@ -33,3 +32,4 @@ test_m2f_smoke.py
 piccheck.py
 **.yaml
 inspect_mask_instances.py
+batch_eval.py
