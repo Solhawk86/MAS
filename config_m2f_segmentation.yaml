@@ -70,7 +70,7 @@ training:
   num_workers: 8
   epochs: 100
   grad_accum_steps: 1
-  eval_interval: 2
+  eval_interval: 1
   save_after_epoch: 60
   lr: 0.0001        # prefer lr = 0.0005 ∗ batchsize/256
   weight_decay: 0.05
