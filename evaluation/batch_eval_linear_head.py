@@ -18,12 +18,14 @@ import yaml
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG = SCRIPT_DIR / "config_eval.yaml"
-DEFAULT_EVAL = SCRIPT_DIR / "eval.py"
+DEFAULT_EVAL = SCRIPT_DIR / "evaluation/eval_linear_head.py"
 WEIGHT_PATTERN = re.compile(r"student_backbone_step_(\d+)\.pth$")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="批量运行 MAS 的 eval.py 评估一组权重")
+    parser = argparse.ArgumentParser(
+        description="批量运行 MAS 的 eval_linear_head.py 评估一组权重"
+    )
     parser.add_argument(
         "--weights-dir",
         required=True,
@@ -88,7 +90,9 @@ def clear_feature_cache(cache_dir: Path) -> None:
 def write_temp_config(base_cfg: dict, weight_path: Path) -> Path:
     cfg_copy = copy.deepcopy(base_cfg)
     cfg_copy["finetuned_weights"] = str(weight_path)
-    tmp = tempfile.NamedTemporaryFile("w", suffix="_eval.yaml", delete=False, encoding="utf-8")
+    tmp = tempfile.NamedTemporaryFile(
+        "w", suffix="_eval.yaml", delete=False, encoding="utf-8"
+    )
     try:
         yaml.safe_dump(cfg_copy, tmp, allow_unicode=True, sort_keys=False)
     finally:
@@ -141,14 +145,18 @@ def main() -> None:
     weights_dir = Path(args.weights_dir).expanduser().resolve()
     eval_script = Path(args.eval_script).expanduser().resolve()
     config_path = Path(args.config).expanduser().resolve()
-    seg_config_path = validate_paths(eval_script, weights_dir, config_path, args.seg_config)
+    seg_config_path = validate_paths(
+        eval_script, weights_dir, config_path, args.seg_config
+    )
 
     base_cfg = load_base_config(config_path)
     cache_dir = resolve_feature_cache_dir(base_cfg, eval_script.parent)
 
     weight_files = collect_weight_files(weights_dir)
     if not weight_files:
-        raise FileNotFoundError(f"在 {weights_dir} 下找不到 student_backbone_step_*.pth 文件")
+        raise FileNotFoundError(
+            f"在 {weights_dir} 下找不到 student_backbone_step_*.pth 文件"
+        )
 
     for weight_path in weight_files:
         print(f"\n=== Evaluating {weight_path.name} ===", flush=True)

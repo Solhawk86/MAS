@@ -10,7 +10,7 @@ from transformers.models.mask2former.modeling_mask2former import (
     Mask2FormerTransformerModule,
 )
 
-from MAS.depth import LearnableDepthQueryEmbedding
+from MAS.depth_embedding import LearnableDepthQueryEmbedding
 
 
 class DepthAwareMask2FormerTransformerModule(Mask2FormerTransformerModule):

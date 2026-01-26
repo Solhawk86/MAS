@@ -28,7 +28,7 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 
 from MAS.data.data import FeatureCacheDataset, SegmentationFolderDataset, build_basic_dataloader  # type: ignore
-from MAS.feature_cache import cache_features_for_dataset
+from evaluation.feature_cache import cache_features_for_dataset
 from MAS.model.backbone_utils import build_backbone
 from dinov3.eval.segmentation.config import (
     DecoderConfig,
@@ -44,11 +44,15 @@ from dinov3.eval.segmentation.config import (
 from dinov3.eval.segmentation.loss import MultiSegmentationLoss
 from dinov3.eval.segmentation.models import build_segmentation_decoder
 from dinov3.eval.segmentation.schedulers import build_scheduler
-from dinov3.eval.segmentation.transforms import make_segmentation_eval_transforms, make_segmentation_train_transforms
+from dinov3.eval.segmentation.transforms import (
+    make_segmentation_eval_transforms,
+    make_segmentation_train_transforms,
+)
 from dinov3.logging import MetricLogger, SmoothedValue
 
-from utils import load_config,_tensor_to_uint8_image
+from utils import load_config, _tensor_to_uint8_image
 import warnings
+
 warnings.filterwarnings("ignore", message=".*weights_only=False.*")
 
 
@@ -110,7 +114,9 @@ class SegmentationEvalConfig:
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     transforms: TransformConfig = field(
         default_factory=lambda: TransformConfig(
-            train=TrainTransformConfig(img_size=518, crop_size=(512, 512), flip_prob=0.5),
+            train=TrainTransformConfig(
+                img_size=518, crop_size=(512, 512), flip_prob=0.5
+            ),
             eval=EvalTransformConfig(img_size=518),
         )
     )
@@ -121,7 +127,9 @@ class SegmentationEvalConfig:
     save_best_head: bool = True
 
 
-def _prepare_mask_for_display(mask_tensor: torch.Tensor, target_hw: Optional[tuple[int, int]] = None):
+def _prepare_mask_for_display(
+    mask_tensor: torch.Tensor, target_hw: Optional[tuple[int, int]] = None
+):
     mask = mask_tensor.detach().clone()
     if mask.ndim == 3 and mask.shape[0] == 1:
         mask = mask.squeeze(0)
@@ -177,12 +185,20 @@ def save_debug_samples_from_cache(
     debug_root = Path(output_dir) / "debug_samples"
     debug_root.mkdir(parents=True, exist_ok=True)
 
-    model = decoder_head.module if isinstance(decoder_head, torch.nn.parallel.DistributedDataParallel) else decoder_head
+    model = (
+        decoder_head.module
+        if isinstance(decoder_head, torch.nn.parallel.DistributedDataParallel)
+        else decoder_head
+    )
     was_training = model.training
     model.eval()
 
-    mean_tensor = torch.as_tensor(seg_cfg.transforms.mean, dtype=torch.float32).view(-1, 1, 1)
-    std_tensor = torch.as_tensor(seg_cfg.transforms.std, dtype=torch.float32).view(-1, 1, 1)
+    mean_tensor = torch.as_tensor(seg_cfg.transforms.mean, dtype=torch.float32).view(
+        -1, 1, 1
+    )
+    std_tensor = torch.as_tensor(seg_cfg.transforms.std, dtype=torch.float32).view(
+        -1, 1, 1
+    )
 
     for idx, sample_path in enumerate(cache_files):
         sample = torch.load(sample_path, map_location="cpu")
@@ -190,12 +206,16 @@ def save_debug_samples_from_cache(
         mask = sample["mask"].long()
         image_tensor = sample.get("image")
 
-        feature_batch = [feat.unsqueeze(0).to(device, non_blocking=True) for feat in feature_list]
+        feature_batch = [
+            feat.unsqueeze(0).to(device, non_blocking=True) for feat in feature_list
+        ]
         with torch.no_grad():
             logits = model(feature_batch)
         logits_resized = logits
         if logits.shape[-2:] != mask.shape[-2:]:
-            logits_resized = F.interpolate(logits, size=mask.shape[-2:], mode="bilinear", align_corners=False)
+            logits_resized = F.interpolate(
+                logits, size=mask.shape[-2:], mode="bilinear", align_corners=False
+            )
         pred_mask = logits_resized.argmax(dim=1).squeeze(0).cpu().to(torch.long)
 
         sample_dir = debug_root / f"sample_{idx:02d}"
@@ -214,15 +234,31 @@ def save_debug_samples_from_cache(
             sample_dir / "debug_data.pt",
         )
 
-        image_hw = tuple(image_tensor.shape[-2:]) if image_tensor is not None else mask.shape[-2:]
-        _save_mask_image(pred_mask, sample_dir / "pred_mask.png", ignore_index=None, target_hw=image_hw)
-        _save_mask_image(mask, sample_dir / "gt_mask.png", ignore_index=seg_cfg.ignore_index, target_hw=image_hw)
+        image_hw = (
+            tuple(image_tensor.shape[-2:])
+            if image_tensor is not None
+            else mask.shape[-2:]
+        )
+        _save_mask_image(
+            pred_mask,
+            sample_dir / "pred_mask.png",
+            ignore_index=None,
+            target_hw=image_hw,
+        )
+        _save_mask_image(
+            mask,
+            sample_dir / "gt_mask.png",
+            ignore_index=seg_cfg.ignore_index,
+            target_hw=image_hw,
+        )
 
         image_array = _tensor_to_uint8_image(image_tensor, mean_tensor, std_tensor)
         if image_array is not None:
             Image.fromarray(image_array).save(sample_dir / "input_image.png")
         else:
-            logger.warning("样本 %s 缺少原始输入图像张量，未能导出 input_image.png", sample_path)
+            logger.warning(
+                "样本 %s 缺少原始输入图像张量，未能导出 input_image.png", sample_path
+            )
 
         del feature_batch, logits
 
@@ -230,7 +266,9 @@ def save_debug_samples_from_cache(
         model.train()
 
 
-def load_segmentation_eval_config(base_cfg: Dict[str, Any], seg_cfg_path: Optional[str]) -> SegmentationEvalConfig:
+def load_segmentation_eval_config(
+    base_cfg: Dict[str, Any], seg_cfg_path: Optional[str]
+) -> SegmentationEvalConfig:
     if seg_cfg_path:
         raw_cfg = OmegaConf.load(seg_cfg_path)
     else:
@@ -244,6 +282,8 @@ def load_segmentation_eval_config(base_cfg: Dict[str, Any], seg_cfg_path: Option
 
 
 """Train linear head across epochs with periodic evaluation."""
+
+
 def train_linear_head(
     seg_cfg,
     decoder_head,
@@ -255,7 +295,9 @@ def train_linear_head(
     finetuned_weights_path: Optional[str] = None,
 ):
     torch.backends.cudnn.benchmark = True
-    decoder_head = torch.nn.SyncBatchNorm.convert_sync_batchnorm(decoder_head.to(device))
+    decoder_head = torch.nn.SyncBatchNorm.convert_sync_batchnorm(
+        decoder_head.to(device)
+    )
     if is_distributed():
         decoder_head = torch.nn.parallel.DistributedDataParallel(
             decoder_head,
@@ -289,7 +331,9 @@ def train_linear_head(
         constructor_kwargs=scheduler_kwargs,
     )
 
-    autocast_enabled = device.type == "cuda" and seg_cfg.model_dtype == ModelDtype.BFLOAT16
+    autocast_enabled = (
+        device.type == "cuda" and seg_cfg.model_dtype == ModelDtype.BFLOAT16
+    )
     autocast_ctx = torch.autocast if autocast_enabled else _NullContext
     criterion = MultiSegmentationLoss(
         diceloss_weight=seg_cfg.losses.diceloss_weight,
@@ -303,8 +347,16 @@ def train_linear_head(
         output_dir.mkdir(parents=True, exist_ok=True)
 
     eval_history: List[Dict[str, float]] = []
-    train_sampler = train_loader.sampler if isinstance(train_loader.sampler, DistributedSampler) else None
-    val_sampler = val_loader.sampler if isinstance(val_loader.sampler, DistributedSampler) else None
+    train_sampler = (
+        train_loader.sampler
+        if isinstance(train_loader.sampler, DistributedSampler)
+        else None
+    )
+    val_sampler = (
+        val_loader.sampler
+        if isinstance(val_loader.sampler, DistributedSampler)
+        else None
+    )
     world_size = dist.get_world_size() if is_distributed() else 1
     train_dataset_size = len(train_loader.dataset)
     block_start_time = time.time()
@@ -328,7 +380,9 @@ def train_linear_head(
             train_sampler.set_epoch(epoch)
 
         metric_logger = MetricLogger(delimiter="  ")
-        metric_logger.add_meter("loss", SmoothedValue(window_size=20, fmt="{value:.4f}"))
+        metric_logger.add_meter(
+            "loss", SmoothedValue(window_size=20, fmt="{value:.4f}")
+        )
         if progress_bar is not None:
             progress_bar.set_description(f"Epoch {epoch + 1}/{seg_cfg.epochs}")
 
@@ -338,13 +392,23 @@ def train_linear_head(
             labels = labels.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            with autocast_ctx(device_type=device.type if autocast_enabled else "cpu", dtype=seg_cfg.model_dtype.autocast_dtype):
+            with autocast_ctx(
+                device_type=device.type if autocast_enabled else "cpu",
+                dtype=seg_cfg.model_dtype.autocast_dtype,
+            ):
                 logits = decoder_head(features)
                 if logits.shape[-2:] != labels.shape[-2:]:
-                    logits = F.interpolate(logits, size=labels.shape[-2:], mode="bilinear", align_corners=False)
+                    logits = F.interpolate(
+                        logits,
+                        size=labels.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    )
                 loss = criterion(logits, labels)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(decoder_head.parameters(), seg_cfg.optimizer.gradient_clip)
+            torch.nn.utils.clip_grad_norm_(
+                decoder_head.parameters(), seg_cfg.optimizer.gradient_clip
+            )
             optimizer.step()
             scheduler.step()
             metric_logger.update(loss=float(loss.item()))
@@ -358,13 +422,21 @@ def train_linear_head(
             progress_bar.update(1)
             progress_bar.set_postfix_str(f"{train_dataset_size}/{train_dataset_size}")
 
-        should_eval = ((epoch + 1) % seg_cfg.eval_every_epochs == 0) or ((epoch + 1) == seg_cfg.epochs)
+        should_eval = ((epoch + 1) % seg_cfg.eval_every_epochs == 0) or (
+            (epoch + 1) == seg_cfg.epochs
+        )
         if should_eval:
             if val_sampler is not None:
                 val_sampler.set_epoch(epoch)
             block_elapsed = time.time() - block_start_time
             metrics = evaluate_model(
-                decoder_head.module if isinstance(decoder_head, torch.nn.parallel.DistributedDataParallel) else decoder_head,
+                (
+                    decoder_head.module
+                    if isinstance(
+                        decoder_head, torch.nn.parallel.DistributedDataParallel
+                    )
+                    else decoder_head
+                ),
                 val_loader,
                 device,
                 seg_cfg.decoder_head.num_classes,
@@ -391,7 +463,13 @@ def train_linear_head(
                 best_metrics_dict = metrics
                 if seg_cfg.save_best_head and is_main_process():
                     torch.save(
-                        (decoder_head.module if isinstance(decoder_head, torch.nn.parallel.DistributedDataParallel) else decoder_head).state_dict(),
+                        (
+                            decoder_head.module
+                            if isinstance(
+                                decoder_head, torch.nn.parallel.DistributedDataParallel
+                            )
+                            else decoder_head
+                        ).state_dict(),
                         output_dir / "linear_head_best.pth",
                     )
             eval_history.append(
@@ -409,7 +487,11 @@ def train_linear_head(
 
     if is_main_process():
         torch.save(
-            (decoder_head.module if isinstance(decoder_head, torch.nn.parallel.DistributedDataParallel) else decoder_head).state_dict(),
+            (
+                decoder_head.module
+                if isinstance(decoder_head, torch.nn.parallel.DistributedDataParallel)
+                else decoder_head
+            ).state_dict(),
             output_dir / "linear_head_last.pth",
         )
         results_path = output_dir / RESULTS_FILENAME
@@ -423,10 +505,16 @@ def train_linear_head(
         history_path = output_dir / "eval_history.csv"
         if eval_history:
             with open(history_path, "w", newline="", encoding="utf-8") as hf:
-                writer = csv.DictWriter(hf, fieldnames=["epoch", "mIoU", "best_mIoU", "block_time_sec"])
+                writer = csv.DictWriter(
+                    hf, fieldnames=["epoch", "mIoU", "best_mIoU", "block_time_sec"]
+                )
                 writer.writeheader()
                 writer.writerows(eval_history)
-        logger.info("训练完成，总耗时 %.1fs，最佳 mIoU=%.2f", time.time() - start_time, best_metric)
+        logger.info(
+            "训练完成，总耗时 %.1fs，最佳 mIoU=%.2f",
+            time.time() - start_time,
+            best_metric,
+        )
     if is_main_process() and debug_cache_dir is not None:
         try:
             save_debug_samples_from_cache(
@@ -456,10 +544,15 @@ def evaluate_model(model, dataloader, device, num_classes, seg_cfg, autocast_ctx
             features = [feat.to(device, non_blocking=True) for feat in features]
             labels = labels.to(device, non_blocking=True)
             image_counter += labels.shape[0]
-            with autocast_ctx(device_type=device.type if device.type == "cuda" else "cpu", dtype=seg_cfg.model_dtype.autocast_dtype):
+            with autocast_ctx(
+                device_type=device.type if device.type == "cuda" else "cpu",
+                dtype=seg_cfg.model_dtype.autocast_dtype,
+            ):
                 logits = model(features)
             if logits.shape[-2:] != labels.shape[-2:]:
-                logits = F.interpolate(logits, size=labels.shape[-2:], mode="bilinear", align_corners=False)
+                logits = F.interpolate(
+                    logits, size=labels.shape[-2:], mode="bilinear", align_corners=False
+                )
             preds = logits.argmax(dim=1)
             for pred_mask, target_mask in zip(preds, labels):
                 valid_mask = target_mask != seg_cfg.ignore_index

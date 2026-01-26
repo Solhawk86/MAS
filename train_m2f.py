@@ -18,6 +18,8 @@ import numpy as np
 
 CURRENT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = CURRENT_DIR.parent
+if not (PROJECT_ROOT / "MAS").exists():
+    PROJECT_ROOT = PROJECT_ROOT.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -35,12 +37,12 @@ from MAS.evaluation.inference import (
     _run_full_image_inference,
     export_predictions,
 )
-from MAS.log import init_training_logger
+from mas_logging.log import init_training_logger
 from MAS.evaluation.metrics import evaluate_prediction_directory, cal_iou
 from MAS.model.backbone_utils import build_backbone
 from MAS.utils import _distributed_mean, _setup_device_and_distributed, load_config
 from MAS.mask2former.utils import *
-from MAS.mask2former.model import DinoMask2Former
+from MAS.mask2former.mask2former import DinoMask2Former
 from dinov3.eval.segmentation.models.backbone.dinov3_adapter import DINOv3_Adapter
 from MAS.mask2former.utils import (
     _as_dtype,

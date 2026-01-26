@@ -1,0 +1,32 @@
+# Mask2Former checkpoint evaluation config
+# 填写训练阶段使用的 Mask2Former 配置路径、待评估的 checkpoint、以及验证集路径。
+model_config: "config_m2f_segmentation.yaml"
+checkpoint_path: "/data/hong/weights/20260121_08/checkpoints/best.pt"
+
+# 数据集/预处理设置，可覆盖训练配置文件中的 dataset 字段。
+dataset:
+  val_images: "/data/hong/data/USOD10k_merge/test/images"
+  val_masks: "/data/hong/data/USOD10k_merge/test/binary_masks"
+  num_classes: 2
+  ignore_index: -1
+  transforms:
+    mean: [123.675, 116.28, 103.53]
+    std: [58.395, 57.12, 57.375]
+    eval:
+      img_size: 512
+      crop_size: [512, 512]
+      stride: 341
+      inference_mode: "slide"
+      use_tta: false
+      tta_ratios: [1.0]
+
+# 评估运行参数。
+evaluation:
+  output_dir: "/data/hong/weights/20260121_08"
+  prediction_dir: "best_pt_predictions"
+  batch_size: 1
+  num_workers: 2
+  autocast_dtype: "bfloat16"
+  device: "auto"  # auto -> CUDA 优先，否则 CPU
+  compute_metrics: true
+  gt_dir: null     # 默认使用 dataset.val_masks，若评估集不同可单独指定

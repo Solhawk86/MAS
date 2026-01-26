@@ -6,7 +6,7 @@ import torch.nn.functional as F
 import sys
 import matplotlib.pyplot as plt
 
-sys.path.append('/home/yangyan/hong/dinov3')
+sys.path.append("/home/yangyan/hong/dinov3")
 
 from copy import deepcopy
 from functools import partial
@@ -15,10 +15,13 @@ from collections.abc import Iterable, Mapping, MutableMapping
 from typing import Any, Union
 
 from utils import *
-from dinov3.eval.segmentation.models import BackboneLayersSet, ModelWithIntermediateLayers
+from dinov3.eval.segmentation.models import (
+    BackboneLayersSet,
+    ModelWithIntermediateLayers,
+)
 from dinov3.layers.dino_head import DINOHead
 from MAS.model.Dino_LoRA import inject_lora_qv_into_vit, LoRA_qkv
-from dinov3.models import build_model_for_eval  
+from dinov3.models import build_model_for_eval
 from torch.nn.parallel import DistributedDataParallel
 
 # NOTE: DualImageDINOv3 保留供分割任务调用；DINOv3SelfSupervised 则负责自监督 LoRA 训练。
@@ -58,7 +61,9 @@ class DualImageDINOv3(nn.Module):
         self.cfg = dict_to_namespace(processed_cfg_dict)
 
         # 加载预训练权重路径
-        pretrained_weights = backbone_pth or processed_cfg_dict.get("pretrained_weights")
+        pretrained_weights = backbone_pth or processed_cfg_dict.get(
+            "pretrained_weights"
+        )
         if not pretrained_weights:
             raise ValueError(
                 "未在 cfg['pretrained_weights'] 中找到权重路径，也未显式传入 `backbone_pth`。"
@@ -85,23 +90,31 @@ class DualImageDINOv3(nn.Module):
             )
 
         # 记录默认的训练模式：若显式传入则使用传入值，否则在启用 LoRA 时默认允许梯度
-        self._train_mode_default = self._lora_enabled if train_mode is None else train_mode
+        self._train_mode_default = (
+            self._lora_enabled if train_mode is None else train_mode
+        )
 
         # 封装成可提取中间层输出的模型
-        autocast_device_type = "cuda" if self.device.type == "cuda" else self.device.type
-        self._backbone_indices = self._resolve_backbone_out_layers(self.backbone, backbone_out_layers)
+        autocast_device_type = (
+            "cuda" if self.device.type == "cuda" else self.device.type
+        )
+        self._backbone_indices = self._resolve_backbone_out_layers(
+            self.backbone, backbone_out_layers
+        )
         self._autocast_ctx = partial(
             torch.autocast,
             device_type=autocast_device_type,
             enabled=self.device.type == "cuda",
             dtype=torch.bfloat16,
         )
-        self.feature_extractor = ModelWithIntermediateLayers(   #官方实现，返回输入的feature
-            self.backbone,
-            n=self._backbone_indices,
-            autocast_ctx=self._autocast_ctx,
-            reshape=False,
-            return_class_token=False,
+        self.feature_extractor = (
+            ModelWithIntermediateLayers(  # 官方实现，返回输入的feature
+                self.backbone,
+                n=self._backbone_indices,
+                autocast_ctx=self._autocast_ctx,
+                reshape=False,
+                return_class_token=False,
+            )
         )
 
         # LoRA 层需要保持可训练（默认 requires_grad=True）。显式确认其状态，防止意外被冻结
@@ -121,7 +134,7 @@ class DualImageDINOv3(nn.Module):
         """
         img1 = img1.to(self.device)
         img2 = img2.to(self.device)
-        
+
         mode = self._train_mode_default if train_mode is None else train_mode
 
         if mode:
@@ -133,10 +146,10 @@ class DualImageDINOv3(nn.Module):
         return feat1, feat2
 
     def _forward_with_grad(self, images: torch.Tensor):
-        '''
+        """
         训练模式下获取中间层特征，允许梯度在 LoRA 中回传
         层配置参考_resolve_backbone_out_layers
-        '''
+        """
         with self._autocast_ctx():
             features = self.backbone.get_intermediate_layers(
                 images,
@@ -165,7 +178,9 @@ class DualImageDINOv3(nn.Module):
             try:
                 layerset = BackboneLayersSet[backbone_out_layers]
             except KeyError:
-                raise ValueError(f"无法识别的 backbone_out_layers: {backbone_out_layers}") from None
+                raise ValueError(
+                    f"无法识别的 backbone_out_layers: {backbone_out_layers}"
+                ) from None
         else:
             layerset = None
 
@@ -192,7 +207,9 @@ class DualImageDINOv3(nn.Module):
         )
 
     @staticmethod
-    def _layerset_to_indices(model: nn.Module, layerset: BackboneLayersSet) -> list[int]:
+    def _layerset_to_indices(
+        model: nn.Module, layerset: BackboneLayersSet
+    ) -> list[int]:
         n_blocks = getattr(model, "n_blocks", None)
         if n_blocks is None:
             raise ValueError("模型缺少 n_blocks 属性，无法确定中间层索引")
@@ -203,14 +220,16 @@ class DualImageDINOv3(nn.Module):
             indices = list(range(max(0, n_blocks - 4), n_blocks))
         elif layerset == BackboneLayersSet.FOUR_EVEN_INTERVALS:
             if n_blocks == 24:
-                indices = [4, 11, 17, 23] # used in paper
+                indices = [4, 11, 17, 23]  # used in paper
             else:
                 step = max(1, n_blocks // 4)
                 indices = [min(n_blocks - 1, step * i - 1) for i in range(1, 5)]
         else:
             raise ValueError(f"暂不支持的 BackboneLayersSet: {layerset}")
         if any(idx >= n_blocks or idx < 0 for idx in indices):
-            raise ValueError(f"生成的层索引 {indices} 超出模型 block 范围 (0, {n_blocks - 1})")
+            raise ValueError(
+                f"生成的层索引 {indices} 超出模型 block 范围 (0, {n_blocks - 1})"
+            )
         return indices
 
 
@@ -250,7 +269,7 @@ class DINOv3SelfSupervised(nn.Module):
         student_backbone = deepcopy(teacher_backbone)
         student_backbone.to(self.device)
         student_backbone.train()
-        
+
         # 注入LoRA
         self._lora_enabled = lora_layers is not None
         if self._lora_enabled:
@@ -440,7 +459,9 @@ class DINOv3SelfSupervised(nn.Module):
         patch = backbone_out["x_norm_patchtokens"]
 
         # 只在被遮挡的 patch 上执行 iBOT head，降低计算量
-        masked_patch_pre_head = torch.index_select(patch.flatten(0, 1), 0, mask_indices_list)
+        masked_patch_pre_head = torch.index_select(
+            patch.flatten(0, 1), 0, mask_indices_list
+        )
         masked_patch_after_head = self.teacher["ibot_head"](masked_patch_pre_head)
 
         cls_after_head = self.teacher["dino_head"](cls)
@@ -448,7 +469,7 @@ class DINOv3SelfSupervised(nn.Module):
             dino_loss.sinkhorn_knopp_teacher,
             cls_after_head,
             teacher_temp=teacher_temp,
-        )  #温度归一化
+        )  # 温度归一化
         cls_centered = cls_centered_flat.unflatten(0, (n_crops, B))
         masked_patch_centered = self._safe_sinkhorn(
             ibot_loss.sinkhorn_knopp_teacher,
@@ -494,7 +515,9 @@ class DINOv3SelfSupervised(nn.Module):
         l_reg = local_out["x_storage_tokens"]
         l_patch = local_out["x_norm_patchtokens"]
 
-        masked_patches_pre_head = torch.index_select(g_patch.flatten(0, 1), 0, mask_indices_list)
+        masked_patches_pre_head = torch.index_select(
+            g_patch.flatten(0, 1), 0, mask_indices_list
+        )
         masked_patch_after_head = self.student["ibot_head"](masked_patches_pre_head)
 
         buffer = [g_cls, l_cls]
@@ -532,31 +555,34 @@ class DINOv3SelfSupervised(nn.Module):
 
     def student_state_dict(self, *, include_heads: bool = True) -> dict[str, Any]:
         if include_heads:
-            return {k: self._unwrap_ddp(v).state_dict() for k, v in self.student.items()}
+            return {
+                k: self._unwrap_ddp(v).state_dict() for k, v in self.student.items()
+            }
         return {"backbone": self.student_backbone_state_dict()}
+
 
 def test():
     torch.cuda.set_device(2)
     device = "cuda:2" if torch.cuda.is_available() else "cpu"
 
-    cfg = load_config('config_eval.yaml')
+    cfg = load_config("config_eval.yaml")
 
     model = DualImageDINOv3(cfg=cfg, device=device).to(device)
     model.eval()
     print(next(model.backbone.parameters()).device)
-    
+
     img = torch.randn(2, 3, 518, 518)
     img_aug = torch.randn(2, 3, 518, 518)
 
     feat1, feat2 = model(img, img_aug)
-    
+
     print("保持进程，按 Ctrl+C 退出...")
     try:
         while True:
             time.sleep(10)
     except KeyboardInterrupt:
         print("退出测试，释放显存")
-        
+
     print(f"原图特征层数: {len(feat1)}")
     for i, feat in enumerate(feat1, start=1):
         if isinstance(feat, tuple):
@@ -572,6 +598,7 @@ def test():
             print(f"层 {i}: patch特征 {patch_feat.shape}, cls特征 {cls_feat.shape}")
         else:
             print(f"层 {i}: {feat.shape}")
+
 
 if __name__ == "__main__":
     test()
