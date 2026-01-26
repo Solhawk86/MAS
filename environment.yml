@@ -1,0 +1,23 @@
+name: dinov3
+channels:
+  - pytorch
+  - nvidia
+  - defaults
+
+dependencies:
+  - python=3.11
+  - pytorch
+  - pytorch-cuda=12.4
+  - pyyaml
+  - omegaconf
+  - pip
+  - pip:
+      - timm
+      - einops
+      - albumentations
+      - opencv-python-headless
+      - tensorboard
+      - tqdm
+      - submitit
+      - transformers
+      - pytorch-lightning
