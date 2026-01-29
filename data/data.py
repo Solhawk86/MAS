@@ -17,12 +17,13 @@ from data.dino_augmentations import DataAugmentationDINO
 from data.augmentation import BatchWaveletSwapper
 from dinov3.data.collate import collate_data_and_cast
 from dinov3.data.masking import MaskingGenerator
-from dinov3.eval.segmentation.transforms import (
+from MAS.data.segmentation_transforms import (
     make_segmentation_eval_transforms,
     make_segmentation_train_transforms,
 )
 
 # NOTE: 图像+mask 数据集，用于下游分割任务；新增自监督数据pipeline。
+
 
 def make_transform(resize_size: int | list[int] = 518):
     to_tensor = v2.ToImage()
@@ -34,18 +35,22 @@ def make_transform(resize_size: int | list[int] = 518):
     )
     return v2.Compose([to_tensor, resize, to_float, normalize])
 
+
 def resize_with_patch_transform(
     mask_image,
     image_size: int = 518,
     patch_size: int = 16,
 ) -> torch.Tensor:
-    '''
+    """
     mask 与特征 patch 对齐，保证预测 mask 与 GT 尺寸一致
-    '''
+    """
     w, h = mask_image.size
     h_patches = int(image_size / patch_size)
     w_patches = int((w * image_size) / (h * patch_size))
-    return TF.to_tensor(TF.resize(mask_image, (h_patches * patch_size, w_patches * patch_size)))
+    return TF.to_tensor(
+        TF.resize(mask_image, (h_patches * patch_size, w_patches * patch_size))
+    )
+
 
 def make_enhance_transform(resize_size: int | list[int] = 518) -> Callable:
     """
@@ -66,11 +71,20 @@ def make_enhance_transform(resize_size: int | list[int] = 518) -> Callable:
 class SegmentationFolderDataset(TorchDataset):
     """图像/掩码文件夹对，按文件名匹配。"""
 
-    def __init__(self, image_dir: Path, mask_dir: Path, transforms, *, keep_image_lists: bool = False):
+    def __init__(
+        self,
+        image_dir: Path,
+        mask_dir: Path,
+        transforms,
+        *,
+        keep_image_lists: bool = False,
+        ignore_index: Optional[int] = None,
+    ):
         self.image_dir = image_dir
         self.mask_dir = mask_dir
         self.transforms = transforms
         self.keep_image_lists = keep_image_lists
+        self.ignore_index = ignore_index
         image_map = self._scan(image_dir, {"jpg", "jpeg", "png"})
         mask_map = self._scan(mask_dir, {"png", "jpg", "jpeg"})
         common = sorted(image_map.keys() & mask_map.keys())
@@ -98,7 +112,7 @@ class SegmentationFolderDataset(TorchDataset):
         image, mask = self.transforms(image, mask)
         image_tensor = self._prepare_image_tensor(image)
         mask_tensor = self._ensure_long_mask(mask)
-        mask_tensor = normalize_binary_mask(mask_tensor)
+        mask_tensor = normalize_binary_mask(mask_tensor, ignore_index=self.ignore_index)
         return image_tensor, mask_tensor, idx, orig_size, file_name
 
     def _prepare_image_tensor(self, image: Any) -> Any:
@@ -120,7 +134,10 @@ class SegmentationFolderDataset(TorchDataset):
             tensor = tensor.squeeze(0)
         return tensor.long()
 
-def normalize_binary_mask(mask: torch.Tensor) -> torch.Tensor:
+
+def normalize_binary_mask(
+    mask: torch.Tensor, ignore_index: Optional[int] = None
+) -> torch.Tensor:
     """
     将二值 PNG 掩码（0/255 等）归一化为 0/1，避免 loss 计算时遗漏类别。
     多类别掩码保持原状。
@@ -130,12 +147,22 @@ def normalize_binary_mask(mask: torch.Tensor) -> torch.Tensor:
     mask = mask.long()
     if mask.numel() == 0:
         return mask
-    unique_vals = torch.unique(mask)
+    ignore_mask = torch.zeros_like(mask, dtype=torch.bool)
+    if ignore_index is not None:
+        ignore_mask = mask == ignore_index
+    valid_pixels = mask[~ignore_mask]
+    if valid_pixels.numel() == 0:
+        return mask
+    unique_vals = torch.unique(valid_pixels)
     if unique_vals.numel() <= 2:
         non_negative = bool(torch.all(unique_vals >= 0))
-        has_foreground = bool(torch.any(unique_vals > 0))
+        has_foreground = bool(torch.any(valid_pixels > 0))
         if non_negative and has_foreground:
-            return (mask > 0).long()
+            mask = mask.clone()
+            mask[~ignore_mask] = (valid_pixels > 0).long()
+            if ignore_index is not None:
+                mask[ignore_mask] = ignore_index
+            return mask
     return mask
 
 
@@ -179,7 +206,11 @@ def _build_dataloader(
     distributed: bool,
     collate_fn: Optional[Callable] = None,
 ):
-    sampler = DistributedSampler(dataset, shuffle=shuffle, drop_last=False) if distributed else None
+    sampler = (
+        DistributedSampler(dataset, shuffle=shuffle, drop_last=False)
+        if distributed
+        else None
+    )
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -217,14 +248,18 @@ def build_segmentation_datasets_from_cfg(dataset_cfg: dict):
     std = transforms_cfg.get("std", (0.229, 0.224, 0.225))
     train_tf_cfg = transforms_cfg.get("train", {})
     eval_tf_cfg = transforms_cfg.get("eval", {})
+    ignore_index = dataset_cfg.get("ignore_index")
 
     train_transforms = make_segmentation_train_transforms(
         img_size=train_tf_cfg.get("img_size", 256),
-        random_img_size_ratio_range=train_tf_cfg.get("random_img_size_ratio_range", [0.5, 2.0]),
+        random_img_size_ratio_range=train_tf_cfg.get(
+            "random_img_size_ratio_range", [0.5, 2.0]
+        ),
         crop_size=train_tf_cfg.get("crop_size", [256, 256]),
         flip_prob=train_tf_cfg.get("flip_prob", 0.5),
         mean=mean,
         std=std,
+        ignore_index=ignore_index,
     )
     eval_img_size = eval_tf_cfg.get("img_size", 256)
     if isinstance(eval_img_size, int):
@@ -238,9 +273,15 @@ def build_segmentation_datasets_from_cfg(dataset_cfg: dict):
         std=std,
     )
 
-    train_images, train_masks, val_images, val_masks = _resolve_dataset_paths(dataset_cfg)
-    train_dataset = SegmentationFolderDataset(train_images, train_masks, train_transforms)
-    val_dataset = SegmentationFolderDataset(val_images, val_masks, eval_transforms)
+    train_images, train_masks, val_images, val_masks = _resolve_dataset_paths(
+        dataset_cfg
+    )
+    train_dataset = SegmentationFolderDataset(
+        train_images, train_masks, train_transforms, ignore_index=ignore_index
+    )
+    val_dataset = SegmentationFolderDataset(
+        val_images, val_masks, eval_transforms, ignore_index=ignore_index
+    )
     return train_dataset, val_dataset
 
 
@@ -293,6 +334,7 @@ def build_cached_feature_dataloader(
         distributed=distributed,
     )
 
+
 class Dataset(TorchDataset):
     """
     数据集加载类（图片 + mask）。
@@ -303,7 +345,9 @@ class Dataset(TorchDataset):
         transform: 可选预处理函数，函数签名 transform(img, mask)
     """
 
-    def __init__(self, base_dir: str, dataset_name: str, transform: Optional[Callable] = None):
+    def __init__(
+        self, base_dir: str, dataset_name: str, transform: Optional[Callable] = None
+    ):
         self.img_dir = Path(base_dir) / dataset_name / "test/Image"
         self.mask_dir = Path(base_dir) / dataset_name / "test/Mask"
 
@@ -312,11 +356,21 @@ class Dataset(TorchDataset):
         if not self.mask_dir.exists():
             raise ValueError(f"Mask folder {self.mask_dir} does not exist")
 
-        self.img_paths = sorted([p for p in self.img_dir.iterdir() if p.suffix.lower() in [".jpg", ".png", ".jpeg"]])
-        self.mask_paths = sorted([p for p in self.mask_dir.iterdir() if p.suffix.lower() in [".png", ".jpg"]])
+        self.img_paths = sorted(
+            [
+                p
+                for p in self.img_dir.iterdir()
+                if p.suffix.lower() in [".jpg", ".png", ".jpeg"]
+            ]
+        )
+        self.mask_paths = sorted(
+            [p for p in self.mask_dir.iterdir() if p.suffix.lower() in [".png", ".jpg"]]
+        )
 
         if len(self.img_paths) != len(self.mask_paths):
-            raise ValueError(f"Image and mask count mismatch: {len(self.img_paths)} vs {len(self.mask_paths)}")
+            raise ValueError(
+                f"Image and mask count mismatch: {len(self.img_paths)} vs {len(self.mask_paths)}"
+            )
 
         self.transform = transform
 
@@ -353,7 +407,8 @@ class Dataset(TorchDataset):
         with Image.open(img_path) as img:
             w, h = img.size
         return int(h), int(w)
-    
+
+
 class InfiniteDualDataloader:
     """单 DataLoader 版本，针对同一 batch 生成 (raw, enhance) 对。"""
 
@@ -456,7 +511,10 @@ class ImagesOnlyDataset(TorchDataset):
                 with Image.open(img_path) as img:
                     cached = img.convert("RGB").copy()
                 self._image_cache[idx] = cached
-                if self.cache_max_images is not None and len(self._image_cache) > self.cache_max_images:
+                if (
+                    self.cache_max_images is not None
+                    and len(self._image_cache) > self.cache_max_images
+                ):
                     self._image_cache.popitem(last=False)
             else:
                 self._image_cache.move_to_end(idx)
@@ -466,7 +524,9 @@ class ImagesOnlyDataset(TorchDataset):
                 img = img_obj.convert("RGB")
 
         if self.transform is None:
-            raise RuntimeError("ImagesOnlyDataset requires a transform that returns multi-view crops")
+            raise RuntimeError(
+                "ImagesOnlyDataset requires a transform that returns multi-view crops"
+            )
         sample = self.transform(img)
         metadata = {"path": str(img_path)}
         return sample, metadata
@@ -495,7 +555,9 @@ def build_ssl_dataloader(
     data_cfg = ssl_cfg.get("data", {}) if ssl_cfg else {}
 
     # 多尺度裁剪超参直接复用 DINOv3，默认读取 YAML 中的 ssl.data
-    global_crops_size = data_cfg.get("global_crops_size", ssl_cfg.get("global_crops_size", 224))
+    global_crops_size = data_cfg.get(
+        "global_crops_size", ssl_cfg.get("global_crops_size", 224)
+    )
     local_crops_size = data_cfg.get("local_crops_size", 96)
     local_crops_number = data_cfg.get("local_crops_number", 6)
     global_crops_scale = tuple(data_cfg.get("global_crops_scale", (0.4, 1.0)))
@@ -507,8 +569,12 @@ def build_ssl_dataloader(
     if cache_max_images is not None:
         cache_max_images = int(cache_max_images)
     pin_memory = bool(data_cfg.get("pin_memory", True))
-    persistent_workers = bool(data_cfg.get("persistent_workers", True)) if num_workers > 0 else False
-    prefetch_factor = int(data_cfg.get("prefetch_factor", 4)) if num_workers > 0 else None
+    persistent_workers = (
+        bool(data_cfg.get("persistent_workers", True)) if num_workers > 0 else False
+    )
+    prefetch_factor = (
+        int(data_cfg.get("prefetch_factor", 4)) if num_workers > 0 else None
+    )
 
     augmentation = DataAugmentationDINO(
         global_crops_scale=global_crops_scale,
@@ -554,7 +620,9 @@ def build_ssl_dataloader(
     if wavelet_ratio > 0:
         clamp_min = wavelet_cfg.get("clamp_min", 0.0)
         clamp_max = wavelet_cfg.get("clamp_max", 1.0)
-        clamp_tuple = None if wavelet_cfg.get("clamp_disable", False) else (clamp_min, clamp_max)
+        clamp_tuple = (
+            None if wavelet_cfg.get("clamp_disable", False) else (clamp_min, clamp_max)
+        )
         local_swap_count = int(wavelet_cfg.get("local_swap_count"))
         swapper = BatchWaveletSwapper(
             swap_ratio=wavelet_ratio,
@@ -581,7 +649,9 @@ def build_ssl_dataloader(
             if torch.distributed.is_available() and torch.distributed.is_initialized():
                 num_replicas = torch.distributed.get_world_size()
             else:
-                num_replicas = torch.cuda.device_count() if torch.cuda.is_available() else 1
+                num_replicas = (
+                    torch.cuda.device_count() if torch.cuda.is_available() else 1
+                )
         if rank is None:
             if torch.distributed.is_available() and torch.distributed.is_initialized():
                 rank = torch.distributed.get_rank()
