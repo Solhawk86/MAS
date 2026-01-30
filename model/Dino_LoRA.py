@@ -14,7 +14,7 @@ class LoRA_qkv(nn.Module):
         self.qkv = base_qkv  # 原始 Linear/LinearKMaskedBias: in_features -> 3*C
         self.rank = rank
         self.alpha = alpha
-        self.scaling = rank / alpha
+        self.scaling = alpha / rank
         self.dropout = nn.Dropout(dropout)
 
         self.in_features = getattr(self.qkv, "in_features", None)
