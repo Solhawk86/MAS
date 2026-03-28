@@ -1,0 +1,26 @@
+base_config: "config_m2f_segmentation.yaml"
+
+datasets:
+  - name: "MAS3K"
+    train_images: "/data/hong/data/MAS3K/train/Image"
+    train_masks: "/data/hong/data/MAS3K/train/Mask"
+    val_images: "/data/hong/data/MAS3K/test/Image"
+    val_masks: "/data/hong/data/MAS3K/test/binary_label"
+
+  - name: "RMAS"
+    train_images: "/data/hong/data/RMAS/train/img"
+    train_masks: "/data/hong/data/RMAS/train/binary_label"
+    val_images: "/data/hong/data/RMAS/test/img"
+    val_masks: "/data/hong/data/RMAS/test/binary_label"
+
+  - name: "UFO-120"
+    train_images: "/data/hong/data/UFO-120/train_val/hr"
+    train_masks: "/data/hong/data/UFO-120/train_val/binary_label"
+    val_images: "/data/hong/data/UFO-120/TEST/hr"
+    val_masks: "/data/hong/data/UFO-120/TEST/binary_label"
+
+  - name: "USOD10k_merge"
+    train_images: "/data/hong/data/USOD10k_merge/train/images"
+    train_masks: "/data/hong/data/USOD10k_merge/train/binary_masks"
+    val_images: "/data/hong/data/USOD10k_merge/test/images"
+    val_masks: "/data/hong/data/USOD10k_merge/test/binary_masks"

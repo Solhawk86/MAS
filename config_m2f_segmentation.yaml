@@ -30,7 +30,7 @@ model:
   backbone_out_layers: "FOUR_EVEN_INTERVALS"
 
 pretrained_weights: "/data/hong/weights/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth"
-finetuned_weights: "/data/hong/weights/20251208/student_backbone_step_100000.pth"
+finetuned_weights: "/data/hong/student_backbone_step_100000.pth"
 
 train:
   lora_layers: 24
@@ -42,10 +42,10 @@ backbone:
   backbone_out_layers: "FOUR_EVEN_INTERVALS"
 
 dataset:
-  train_images: "/data/hong/data/USOD10k_merge/train/images"
-  train_masks: "/data/hong/data/USOD10k_merge/train/binary_masks"
-  val_images: "/data/hong/data/USOD10k_merge/test/images"
-  val_masks: "/data/hong/data/USOD10k_merge/test/binary_masks"
+  train_images: "/data/hong/data/UFO-120/train_val/hr"
+  train_masks: "/data/hong/data/UFO-120/train_val/binary_label"
+  val_images: "/data/hong/data/UFO-120/TEST/hr"
+  val_masks: "/data/hong/data/UFO-120/TEST/binary_label"
   num_classes: 2
   ignore_index: -1
   transforms:
@@ -70,8 +70,8 @@ training:
   num_workers: 8
   epochs: 100
   grad_accum_steps: 1
-  eval_interval: 1
-  save_after_epoch: 60
+  eval_interval: 5
+  save_after_epoch: 70
   lr: 0.0001        # prefer lr = 0.0005 ∗ batchsize/256
   weight_decay: 0.05
   beta1: 0.9
@@ -102,6 +102,7 @@ mask2former:
   enforce_input_projection: false
   common_stride: 4
   num_queries: 60
+  use_depth_embedding: true
   depth_num_groups: 3
   num_heads: 8
   encoder_layers: 6
@@ -118,7 +119,7 @@ mask2former:
 
 evaluation:
   pred_dir: "predictions"
-  gt_dir: "/data/hong/data/USOD10k_merge/test/binary_masks"
+  gt_dir: "/data/hong/data/UFO-120/TEST/binary_label"
   inference_mode: "slide"
   img_size: 512
   stride: 341
