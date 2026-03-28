@@ -448,23 +448,7 @@ def main() -> None:
     if not pairs:
         raise RuntimeError(f"在 {pred_dir} 下找不到与 {gt_dir} 对应的文件")
 
-    pred_temp: tempfile.TemporaryDirectory | None = None
-    gt_temp: tempfile.TemporaryDirectory | None = None
-    try:
-        pred_temp = tempfile.TemporaryDirectory(prefix="metrics_pred512_")
-        gt_temp = tempfile.TemporaryDirectory(prefix="metrics_gt512_")
-        pred_target = Path(pred_temp.name)
-        gt_target = Path(gt_temp.name)
-        for pred_path, gt_path in pairs:
-            _resize_and_save(pred_path, pred_target / pred_path.name)
-            _resize_and_save(gt_path, gt_target / gt_path.name)
-
-        metrics = evaluate_prediction_directory(pred_target, gt_target)
-    finally:
-        if pred_temp is not None:
-            pred_temp.cleanup()
-        if gt_temp is not None:
-            gt_temp.cleanup()
+    metrics = evaluate_prediction_directory(pred_dir, gt_dir)
 
     for name, value in metrics.items():
         print(f"{name}: {value:.6f}")

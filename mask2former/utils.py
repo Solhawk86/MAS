@@ -52,22 +52,29 @@ def build_mask2former_config(
         output_auxiliary_logits=True,
     )
 
-    depth_groups = int(mask2former_cfg["depth_num_groups"])
-    if depth_groups <= 0:
-        raise ValueError("depth_num_groups 必须大于0")
-    if config.num_queries % depth_groups != 0:
-        raise ValueError(
-            f"num_queries({config.num_queries}) 无法被 depth_num_groups({depth_groups}) 整除"
-        )
-    per_group = config.num_queries // depth_groups
-    REQUIRED_GROUPS = 3
-    REQUIRED_PER_GROUP = 20
-    if depth_groups != REQUIRED_GROUPS or per_group != REQUIRED_PER_GROUP:
-        raise ValueError("当前实验要求将 query 分成 3 组且每组 20 个")
+    use_depth_embedding = bool(mask2former_cfg.get("use_depth_embedding", True))
+    if use_depth_embedding:
+        depth_groups = int(mask2former_cfg["depth_num_groups"])
+        if depth_groups <= 0:
+            raise ValueError("depth_num_groups 必须大于0")
+        if config.num_queries % depth_groups != 0:
+            raise ValueError(
+                f"num_queries({config.num_queries}) 无法被 depth_num_groups({depth_groups}) 整除"
+            )
+        per_group = config.num_queries // depth_groups
+        REQUIRED_GROUPS = 3
+        REQUIRED_PER_GROUP = 20
+        if depth_groups != REQUIRED_GROUPS or per_group != REQUIRED_PER_GROUP:
+            raise ValueError("当前实验要求将 query 分成 3 组且每组 20 个")
 
-    config.depth_num_groups = depth_groups
-    config.depth_loss_weight = float(mask2former_cfg["depth_loss_weight"])
-    config.depth_diversity_weight = float(mask2former_cfg["depth_diversity_weight"])
+        config.depth_num_groups = depth_groups
+        config.depth_loss_weight = float(mask2former_cfg["depth_loss_weight"])
+        config.depth_diversity_weight = float(mask2former_cfg["depth_diversity_weight"])
+    else:
+        config.depth_num_groups = 0
+        config.depth_loss_weight = 0.0
+        config.depth_diversity_weight = 0.0
+    config.use_depth_embedding = use_depth_embedding
 
     transforms_cfg = dataset_cfg["transforms"] if dataset_cfg else {}
     mean = transforms_cfg["mean"] if transforms_cfg else None

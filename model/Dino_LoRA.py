@@ -7,20 +7,24 @@ from torch import nn
 
 
 class LoRA_qkv(nn.Module):
-    def __init__(self, base_qkv: nn.Module, rank: int, alpha: float, dropout: float = 0.0):
+    def __init__(
+        self, base_qkv: nn.Module, rank: int, alpha: float, dropout: float = 0.0
+    ):
         super().__init__()
         if rank <= 0:
             raise ValueError("rank must be > 0")
         self.qkv = base_qkv  # 原始 Linear/LinearKMaskedBias: in_features -> 3*C
         self.rank = rank
         self.alpha = alpha
-        self.scaling = rank / alpha
+        self.scaling = alpha / rank
         self.dropout = nn.Dropout(dropout)
 
         self.in_features = getattr(self.qkv, "in_features", None)
         self.out_features = getattr(self.qkv, "out_features", None)
         if self.in_features is None or self.out_features is None:
-            raise AttributeError("LoRA_qkv 需要底层 qkv 线性层提供 in_features/out_features 属性")
+            raise AttributeError(
+                "LoRA_qkv 需要底层 qkv 线性层提供 in_features/out_features 属性"
+            )
 
         # 冻结原始 qkv 权重
         for p in self.qkv.parameters():
@@ -33,10 +37,18 @@ class LoRA_qkv(nn.Module):
         dtype = self.qkv.weight.dtype
 
         # 为 q 和 v 分别构建 LoRA(A/B)
-        self.lora_a_q = nn.Linear(in_features, rank, bias=False, device=device, dtype=dtype)
-        self.lora_b_q = nn.Linear(rank, out_per_part, bias=False, device=device, dtype=dtype)
-        self.lora_a_v = nn.Linear(in_features, rank, bias=False, device=device, dtype=dtype)
-        self.lora_b_v = nn.Linear(rank, out_per_part, bias=False, device=device, dtype=dtype)
+        self.lora_a_q = nn.Linear(
+            in_features, rank, bias=False, device=device, dtype=dtype
+        )
+        self.lora_b_q = nn.Linear(
+            rank, out_per_part, bias=False, device=device, dtype=dtype
+        )
+        self.lora_a_v = nn.Linear(
+            in_features, rank, bias=False, device=device, dtype=dtype
+        )
+        self.lora_b_v = nn.Linear(
+            rank, out_per_part, bias=False, device=device, dtype=dtype
+        )
 
         # 初始化 LoRA 权重
         nn.init.kaiming_uniform_(self.lora_a_q.weight, a=math.sqrt(5))
@@ -70,8 +82,12 @@ class LoRA_qkv(nn.Module):
 
         # LoRA 路径，仅作用于 q 和 v 段
         # y = W x + (r/alpha) * B(Ax)
-        lora_q = self.lora_b_q(self.lora_a_q(self.dropout(x))) * self.scaling  # [B, N, C]
-        lora_v = self.lora_b_v(self.lora_a_v(self.dropout(x))) * self.scaling  # [B, N, C]
+        lora_q = (
+            self.lora_b_q(self.lora_a_q(self.dropout(x))) * self.scaling
+        )  # [B, N, C]
+        lora_v = (
+            self.lora_b_v(self.lora_a_v(self.dropout(x))) * self.scaling
+        )  # [B, N, C]
 
         C = self.out_per_part
         # q 段: [:C]，k 段: [C:2C]，v 段: [2C:3C]
@@ -80,7 +96,9 @@ class LoRA_qkv(nn.Module):
         return base_out
 
 
-def inject_lora_qv_into_vit(backbone: nn.Module, layers, rank: int, alpha: float, dropout: float = 0.0):
+def inject_lora_qv_into_vit(
+    backbone: nn.Module, layers, rank: int, alpha: float, dropout: float = 0.0
+):
     """
     将 LoRA_qkv 注入到给定 ViT backbone 的指定 block 层，仅作用于每层自注意力的 q 与 v。
 
@@ -93,7 +111,9 @@ def inject_lora_qv_into_vit(backbone: nn.Module, layers, rank: int, alpha: float
         rank, alpha, dropout: LoRA 超参数
     """
     if isinstance(layers, str) and layers.lower() == "all":
-        target_indices = list(range(getattr(backbone, "n_blocks", len(backbone.blocks))))
+        target_indices = list(
+            range(getattr(backbone, "n_blocks", len(backbone.blocks)))
+        )
     elif isinstance(layers, int):
         n_blocks = getattr(backbone, "n_blocks", len(backbone.blocks))
         target_indices = list(range(max(0, n_blocks - layers), n_blocks))

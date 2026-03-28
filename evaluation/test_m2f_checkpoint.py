@@ -24,7 +24,7 @@ from MAS.evaluation.inference import (  # noqa: E402
     export_predictions,
 )
 from MAS.evaluation.metrics import evaluate_prediction_directory  # noqa: E402
-from MAS.mask2former.model import DinoMask2Former  # noqa: E402
+from mask2former.mask2former import DinoMask2Former  # noqa: E402
 from MAS.mask2former.utils import (  # noqa: E402
     _as_dtype,
     build_mask2former_config,
@@ -32,9 +32,7 @@ from MAS.mask2former.utils import (  # noqa: E402
 )
 from MAS.model.backbone_utils import build_backbone  # noqa: E402
 from MAS.utils import load_config  # noqa: E402
-from dinov3.eval.segmentation.transforms import (
-    make_segmentation_eval_transforms,
-)  # noqa: E402
+from MAS.data.segmentation_transforms import make_segmentation_eval_transforms # noqa: E402
 from dinov3.eval.segmentation.models.backbone.dinov3_adapter import (
     DINOv3_Adapter,
 )  # noqa: E402

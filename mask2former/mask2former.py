@@ -5,7 +5,10 @@ from MAS.mask2former.hf_pixel_decoder_custom import (
     DinoCompatibleMask2FormerPixelDecoder,
 )
 from typing import Sequence
-from transformers.models.mask2former.modeling_mask2former import Mask2FormerLoss
+from transformers.models.mask2former.modeling_mask2former import (
+    Mask2FormerLoss,
+    Mask2FormerTransformerModule,
+)
 
 from MAS.loss import LaplacianClarity, QueryDepthConsistencyLoss
 from MAS.mask2former.depth_transformer import DepthAwareMask2FormerTransformerModule
@@ -29,10 +32,17 @@ class DinoMask2Former(torch.nn.Module):
             config,
             feature_channels=[int(embed_dim)] * len(self.feature_order),
         )
-        self.transformer_module = DepthAwareMask2FormerTransformerModule(
-            in_features=config.feature_size,
-            config=config,
-        )
+        self.use_depth_embedding = bool(getattr(config, "use_depth_embedding", True))
+        if self.use_depth_embedding:
+            self.transformer_module = DepthAwareMask2FormerTransformerModule(
+                in_features=config.feature_size,
+                config=config,
+            )
+        else:
+            self.transformer_module = Mask2FormerTransformerModule(
+                in_features=config.feature_size,
+                config=config,
+            )
         self.class_predictor = torch.nn.Linear(config.hidden_dim, config.num_labels + 1)
         self.loss_weights = {
             "loss_cross_entropy": config.class_weight,
@@ -52,7 +62,11 @@ class DinoMask2Former(torch.nn.Module):
         self.depth_loss_weight = float(getattr(config, "depth_loss_weight"))
         depth_groups = int(getattr(config, "depth_num_groups"))
         depth_div_weight = float(getattr(config, "depth_diversity_weight"))
-        self.depth_loss_enabled = self.depth_loss_weight > 0 and depth_groups > 0
+        self.depth_loss_enabled = (
+            self.use_depth_embedding
+            and self.depth_loss_weight > 0
+            and depth_groups > 0
+        )
         if self.depth_loss_enabled:
             self.depth_clarity = LaplacianClarity()
             self.depth_consistency_loss = QueryDepthConsistencyLoss(
