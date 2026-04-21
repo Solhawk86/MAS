@@ -17,15 +17,17 @@ from MAS.mask2former.depth_transformer import DepthAwareMask2FormerTransformerMo
 class DinoMask2Former(torch.nn.Module):
     def __init__(
         self,
-        feature_extractor: torch.nn.Module,
+        adapter: torch.nn.Module,
         config: Mask2FormerConfig,
         feature_order: Sequence[str],
     ):
         super().__init__()
-        self.feature_extractor = feature_extractor
+        self.adapter = adapter
         self.feature_order = list(feature_order)
-        backbone = getattr(feature_extractor, "backbone", feature_extractor)
-        embed_dim = getattr(backbone, "embed_dim", None)
+        self.backbone = getattr(adapter, "backbone", None)
+        if self.backbone is None:
+            raise ValueError("DinoMask2Former 需要显式提供带 backbone 的 adapter")
+        embed_dim = getattr(self.backbone, "embed_dim", None)
         if embed_dim is None:
             raise ValueError("无法从 DINOv3 主干中推断 embed_dim")
         self.pixel_decoder = DinoCompatibleMask2FormerPixelDecoder(
@@ -54,8 +56,8 @@ class DinoMask2Former(torch.nn.Module):
             weight_dict=self.loss_weights,
         )
         self.config = config
-        self.feature_extractor.eval()
-        self.feature_extractor.requires_grad_(False)
+        self.adapter.requires_grad_(True)
+        self.backbone.requires_grad_(False)
         self._logged_feature_info = False
 
         # depth-aware queries 的额外监督配置
@@ -98,8 +100,7 @@ class DinoMask2Former(torch.nn.Module):
         mask_labels: list[torch.Tensor] | None = None,
         class_labels: list[torch.Tensor] | None = None,
     ):
-        with torch.no_grad():
-            features_dict = self.feature_extractor(pixel_values)
+        features_dict = self.adapter(pixel_values)
         features = [
             features_dict[key] for key in self.feature_order if key in features_dict
         ]

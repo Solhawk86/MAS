@@ -403,7 +403,12 @@ def main() -> None:
     if rank == 0:
         unwrapped = _unwrap(model)
         backbone_params = sum(
-            p.numel() for p in unwrapped.feature_extractor.parameters()
+            p.numel() for p in unwrapped.backbone.parameters()
+        )
+        adapter_params = sum(
+            p.numel()
+            for name, p in unwrapped.adapter.named_parameters()
+            if not name.startswith("backbone.")
         )
         head_params = sum(
             p.numel()
@@ -414,11 +419,15 @@ def main() -> None:
             )
             for p in module.parameters()
         )
-        total_params = backbone_params + head_params
+        total_params = sum(p.numel() for p in unwrapped.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         logger.log_debug(
-            "Model parameters -> backbone: {:,} | head: {:,} | total: {:,} | trainable: {:,}".format(
-                backbone_params, head_params, total_params, trainable_params
+            "Model parameters -> backbone: {:,} | adapter: {:,} | head: {:,} | total: {:,} | trainable: {:,}".format(
+                backbone_params,
+                adapter_params,
+                head_params,
+                total_params,
+                trainable_params,
             )
         )
         logger.log_module_grad_status(unwrapped, label="model")
@@ -539,6 +548,18 @@ def main() -> None:
                         )
                     else:
                         logger.log_message(f"新的最佳 mIoU={best_miou:.4f}")
+            # if (epoch + 1) % 5 == 0:
+            #     periodic_ckpt_path = logger.checkpoint_dir / f"epoch_{epoch + 1:03d}.pt"
+            #     save_checkpoint(
+            #         periodic_ckpt_path,
+            #         model,
+            #         epoch,
+            #         global_step,
+            #         best_miou,
+            #     )
+            #     logger.log_message(
+            #         f"按固定间隔保存 checkpoint: {periodic_ckpt_path}"
+            #     )
         last_epoch = epoch
         if distributed:
             dist.barrier()
