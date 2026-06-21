@@ -1,6 +1,7 @@
 import torch
 
 from transformers import Mask2FormerConfig
+from MAS.model.Dino_LoRA import LoRA_qkv
 from MAS.mask2former.hf_pixel_decoder_custom import (
     DinoCompatibleMask2FormerPixelDecoder,
 )
@@ -58,6 +59,9 @@ class DinoMask2Former(torch.nn.Module):
         self.config = config
         self.adapter.requires_grad_(True)
         self.backbone.requires_grad_(False)
+        for module in self.backbone.modules():
+            if isinstance(module, LoRA_qkv):
+                module.set_lora_requires_grad(True)
         self._logged_feature_info = False
 
         # depth-aware queries 的额外监督配置
