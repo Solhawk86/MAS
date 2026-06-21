@@ -5,6 +5,7 @@
 
     torchrun --nproc_per_node=4 MAS/train_m2f.py --config MAS/config_m2f_segmentation.yaml
 """
+
 from __future__ import annotations
 
 import argparse
@@ -402,9 +403,7 @@ def main() -> None:
     model = DinoMask2Former(adapter, mask2former_config, feature_order).to(device)
     if rank == 0:
         unwrapped = _unwrap(model)
-        backbone_params = sum(
-            p.numel() for p in unwrapped.backbone.parameters()
-        )
+        backbone_params = sum(p.numel() for p in unwrapped.backbone.parameters())
         adapter_params = sum(
             p.numel()
             for name, p in unwrapped.adapter.named_parameters()
@@ -548,18 +547,16 @@ def main() -> None:
                         )
                     else:
                         logger.log_message(f"新的最佳 mIoU={best_miou:.4f}")
-            # if (epoch + 1) % 5 == 0:
-            #     periodic_ckpt_path = logger.checkpoint_dir / f"epoch_{epoch + 1:03d}.pt"
-            #     save_checkpoint(
-            #         periodic_ckpt_path,
-            #         model,
-            #         epoch,
-            #         global_step,
-            #         best_miou,
-            #     )
-            #     logger.log_message(
-            #         f"按固定间隔保存 checkpoint: {periodic_ckpt_path}"
-            #     )
+            if (epoch + 1) % 5 == 0:
+                periodic_ckpt_path = logger.checkpoint_dir / f"epoch_{epoch + 1:03d}.pt"
+                save_checkpoint(
+                    periodic_ckpt_path,
+                    model,
+                    epoch,
+                    global_step,
+                    best_miou,
+                )
+                logger.log_message(f"按固定间隔保存 checkpoint: {periodic_ckpt_path}")
         last_epoch = epoch
         if distributed:
             dist.barrier()
