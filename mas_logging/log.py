@@ -119,6 +119,7 @@ def init_training_logger(
     checkpoint_subdir: str | None,
     weights_root: str | Path | None = None,
     local_weights_root: str | Path | None = None,
+    run_name_prefix: str | None = None,
 ) -> TrainingLogger:
     workspace = _build_workspace(
         rank=rank,
@@ -127,6 +128,7 @@ def init_training_logger(
         checkpoint_subdir=checkpoint_subdir,
         weights_root=weights_root,
         local_weights_root=local_weights_root,
+        run_name_prefix=run_name_prefix,
     )
     logger = _configure_file_logger(workspace.log_file) if rank == 0 else None
     tb_writer = create_tensorboard_writer(workspace.tensorboard_dir, rank, tensorboard_enabled)
@@ -141,6 +143,7 @@ def _build_workspace(
     checkpoint_subdir: str | None,
     weights_root: str | Path | None,
     local_weights_root: str | Path | None,
+    run_name_prefix: str | None,
 ) -> RunWorkspace:
     default_base = Path(__file__).resolve().parent / "weights"
     remote_base = _resolve_workspace_root(weights_root, default_base)
@@ -148,7 +151,7 @@ def _build_workspace(
 
     run_dir_name = ""
     if rank == 0:
-        run_dir_name = _next_run_name(remote_base, [])
+        run_dir_name = _next_run_name(remote_base, [], prefix=run_name_prefix)
         (remote_base / run_dir_name).mkdir(parents=True, exist_ok=True)
 
     if _should_broadcast(distributed):
@@ -190,8 +193,14 @@ def _resolve_workspace_root(path_like: str | Path | None, default: Path) -> Path
     return candidate
 
 
-def _next_run_name(base_dir: Path, mirror_bases: Sequence[Path]) -> str:
+def _next_run_name(
+    base_dir: Path,
+    mirror_bases: Sequence[Path],
+    *,
+    prefix: str | None = None,
+) -> str:
     date_str = datetime.now().strftime("%Y%m%d")
+    clean_prefix = (prefix or "").strip().replace("/", "_")
     suffix = 0
 
     def _exists_any(name: str) -> bool:
@@ -201,7 +210,8 @@ def _next_run_name(base_dir: Path, mirror_bases: Sequence[Path]) -> str:
         return False
 
     while True:
-        name = date_str if suffix == 0 else f"{date_str}_{suffix:02d}"
+        date_part = date_str if suffix == 0 else f"{date_str}_{suffix:02d}"
+        name = f"{clean_prefix}_{date_part}" if clean_prefix else date_part
         if not _exists_any(name):
             return name
         suffix += 1
