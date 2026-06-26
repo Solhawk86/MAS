@@ -10,6 +10,12 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import yaml
+
+_CURRENT_DIR = Path(__file__).resolve().parent
+_DINOV3_ROOT = _CURRENT_DIR.parent / "dinov3"
+if _DINOV3_ROOT.exists() and str(_DINOV3_ROOT) not in sys.path:
+    sys.path.insert(0, str(_DINOV3_ROOT))
+
 from dinov3.distributed import (
     enable as enable_distributed,
     is_enabled as dist_is_enabled,
@@ -214,12 +220,6 @@ def _setup_device_and_distributed() -> tuple[torch.device, int, int, int, bool]:
         rank = 0
         world_size = 1
         local_rank = 0
-        if torch.distributed.is_available() and not torch.distributed.is_initialized():
-            backend = "nccl" if device.type == "cuda" else "gloo"
-            os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-            os.environ.setdefault("MASTER_PORT", "29501")
-            torch.distributed.init_process_group(backend=backend, rank=0, world_size=1)
-            dist.barrier()
         return device, rank, world_size, local_rank, distributed
 
     return device, rank, world_size, local_rank, distributed
