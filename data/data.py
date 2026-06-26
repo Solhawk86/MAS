@@ -7,7 +7,7 @@ from typing import Optional, Callable, Any, Iterable, Dict
 import numpy as np
 import torch
 from PIL import Image
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.utils.data import Dataset as TorchDataset
 from torch.utils.data.distributed import DistributedSampler
 from torchvision.transforms import v2
@@ -282,7 +282,106 @@ def build_segmentation_datasets_from_cfg(dataset_cfg: dict):
     val_dataset = SegmentationFolderDataset(
         val_images, val_masks, eval_transforms, ignore_index=ignore_index
     )
+    train_dataset = _maybe_apply_few_shot_subset(train_dataset, dataset_cfg)
     return train_dataset, val_dataset
+
+
+def _parse_category_species_method(stem: str) -> tuple[str, str, str]:
+    parts = stem.split("_")
+    category = parts[1] if len(parts) > 1 else "UnknownCategory"
+    species = parts[2] if len(parts) > 2 else "UnknownSpecies"
+    method = parts[3] if len(parts) > 3 else "UnknownMethod"
+    return category, species, method
+
+
+def _balanced_few_shot_indices(
+    dataset: SegmentationFolderDataset,
+    *,
+    num_samples: int,
+    seed: int,
+    strategy: str,
+) -> tuple[list[int], list[str]]:
+    if strategy != "category_species_method":
+        raise ValueError(
+            "few_shot.strategy 目前仅支持 'category_species_method'"
+        )
+    if num_samples not in {20, 50, 100, 200}:
+        raise ValueError("few_shot.num_samples 仅支持 200/100/50/20")
+    if num_samples <= 0:
+        raise ValueError("few_shot.num_samples 必须为正整数")
+
+    rng = random.Random(seed)
+    groups: dict[tuple[str, str, str], list[int]] = {}
+    stems: list[str] = []
+    for idx, image_path in enumerate(dataset.image_paths):
+        stem = image_path.stem
+        stems.append(stem)
+        groups.setdefault(_parse_category_species_method(stem), []).append(idx)
+
+    if num_samples >= len(stems):
+        selected_indices = list(range(len(stems)))
+        return selected_indices, [stems[idx] for idx in selected_indices]
+
+    for indices in groups.values():
+        rng.shuffle(indices)
+
+    group_keys = list(groups.keys())
+    rng.shuffle(group_keys)
+    selected: list[int] = []
+    selected_set: set[int] = set()
+
+    while len(selected) < num_samples:
+        progressed = False
+        for key in group_keys:
+            if len(selected) >= num_samples:
+                break
+            candidates = groups[key]
+            while candidates and candidates[0] in selected_set:
+                candidates.pop(0)
+            if not candidates:
+                continue
+            idx = candidates.pop(0)
+            selected.append(idx)
+            selected_set.add(idx)
+            progressed = True
+        if not progressed:
+            break
+
+    if len(selected) < num_samples:
+        remaining = [idx for idx in range(len(stems)) if idx not in selected_set]
+        rng.shuffle(remaining)
+        selected.extend(remaining[: num_samples - len(selected)])
+
+    selected = selected[:num_samples]
+    return selected, [stems[idx] for idx in selected]
+
+
+def _maybe_apply_few_shot_subset(
+    train_dataset: SegmentationFolderDataset,
+    dataset_cfg: dict,
+):
+    few_shot_cfg = dataset_cfg.get("few_shot") or {}
+    if not bool(few_shot_cfg.get("enabled", False)):
+        return train_dataset
+
+    num_samples = int(few_shot_cfg.get("num_samples", 0))
+    seed = int(few_shot_cfg.get("seed", 0))
+    strategy = str(few_shot_cfg.get("strategy", "category_species_method"))
+    indices, selected_stems = _balanced_few_shot_indices(
+        train_dataset,
+        num_samples=num_samples,
+        seed=seed,
+        strategy=strategy,
+    )
+    subset = Subset(train_dataset, indices)
+    subset.few_shot_enabled = True
+    subset.few_shot_full_train_size = len(train_dataset)
+    subset.few_shot_num_samples = len(indices)
+    subset.few_shot_seed = seed
+    subset.few_shot_strategy = strategy
+    subset.few_shot_selected_indices = indices
+    subset.few_shot_selected_stems = selected_stems
+    return subset
 
 
 def build_segmentation_image_dataloaders_from_cfg(

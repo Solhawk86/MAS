@@ -14,6 +14,7 @@ import random
 from collections import defaultdict
 from pathlib import Path
 import sys
+import re
 
 import numpy as np
 
@@ -68,6 +69,27 @@ def parse_args() -> argparse.Namespace:
 
 def _unwrap(module: torch.nn.Module) -> torch.nn.Module:
     return module.module if isinstance(module, DDP) else module
+
+
+def _infer_dataset_name(dataset_cfg: dict) -> str:
+    explicit_name = str(dataset_cfg.get("name") or "").strip()
+    if explicit_name:
+        return re.sub(r"[^A-Za-z0-9_.-]+", "_", explicit_name.lower())
+
+    train_images = dataset_cfg.get("train_images")
+    if train_images:
+        train_images_path = Path(str(train_images)).expanduser()
+        parts = train_images_path.parts
+        if len(parts) >= 3:
+            # /.../<dataset>/train/<images>
+            candidate = parts[-3]
+        else:
+            candidate = train_images_path.parent.parent.name or train_images_path.parent.name
+        candidate = str(candidate).strip().lower()
+        if candidate:
+            return re.sub(r"[^A-Za-z0-9_.-]+", "_", candidate)
+
+    return "dataset"
 
 
 def _resize_mask_to_size(mask: torch.Tensor, height: int, width: int) -> torch.Tensor:
@@ -364,6 +386,47 @@ def save_checkpoint(
     torch.save(state, path)
 
 
+def _few_shot_run_name_prefix(dataset_cfg: dict) -> str | None:
+    few_shot_cfg = dataset_cfg.get("few_shot") or {}
+    if not bool(few_shot_cfg.get("enabled", False)):
+        return None
+    dataset_name = _infer_dataset_name(dataset_cfg)
+    num_samples = int(few_shot_cfg["num_samples"])
+    seed = int(few_shot_cfg["seed"])
+    prefix = f"{dataset_name}_{num_samples}shot_seed{seed}"
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", prefix)
+
+
+def _log_few_shot_dataset_info(logger, train_loader, val_loader) -> None:
+    train_dataset = getattr(train_loader, "dataset", None)
+    val_dataset = getattr(val_loader, "dataset", None)
+    val_size = len(val_dataset) if val_dataset is not None else 0
+    train_size = len(train_dataset) if train_dataset is not None else 0
+    full_train_size = getattr(train_dataset, "few_shot_full_train_size", train_size)
+    selected_stems = getattr(train_dataset, "few_shot_selected_stems", None)
+
+    if selected_stems is None:
+        logger.log_message(
+            f"[Dataset] full_train={full_train_size} few_shot_train=disabled val/test={val_size}"
+        )
+        return
+
+    strategy = getattr(train_dataset, "few_shot_strategy", "unknown")
+    seed = getattr(train_dataset, "few_shot_seed", "unknown")
+    manifest_path = logger.run_dir / "few_shot_train_manifest.txt"
+    manifest_path.write_text("\n".join(selected_stems) + "\n", encoding="utf-8")
+    logger.log_message(
+        "[Dataset] full_train={} few_shot_train={} val/test={} strategy={} seed={}".format(
+            full_train_size,
+            train_size,
+            val_size,
+            strategy,
+            seed,
+        )
+    )
+    logger.log_message(f"[Dataset] few-shot manifest saved to: {manifest_path}")
+
+
 def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
@@ -385,6 +448,7 @@ def main() -> None:
         checkpoint_subdir=train_cfg["checkpoint_dir"],
         weights_root=weights_cfg["storage_dir"],
         local_weights_root=weights_cfg["local_dir"],
+        run_name_prefix=_few_shot_run_name_prefix(dataset_cfg),
     )
     if rank == 0:
         logger.log_config(cfg)
@@ -437,6 +501,8 @@ def main() -> None:
         device.type,
         distributed=distributed,
     )
+    if rank == 0:
+        _log_few_shot_dataset_info(logger, train_loader, val_loader)
 
     if distributed:
         model = DDP(
