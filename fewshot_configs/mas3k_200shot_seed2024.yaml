@@ -120,6 +120,13 @@ mask2former:
   enforce_input_projection: false
   common_stride: 4
   num_queries: 60
+  use_opp_prior: true
+  opp_prior_weight: 1.0
+  opp_prior_feature_keys:
+  - '1'
+  - '2'
+  - '3'
+  - '4'
   use_depth_embedding: true
   depth_num_groups: 3
   num_heads: 8

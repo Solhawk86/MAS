@@ -13,6 +13,7 @@ from transformers.models.mask2former.modeling_mask2former import (
 
 from MAS.loss import LaplacianClarity, QueryDepthConsistencyLoss
 from MAS.mask2former.depth_transformer import DepthAwareMask2FormerTransformerModule
+from MAS.mask2former.opp_prior import ObjectPriorHead, OPPLoss
 
 
 class DinoMask2Former(torch.nn.Module):
@@ -57,6 +58,14 @@ class DinoMask2Former(torch.nn.Module):
             weight_dict=self.loss_weights,
         )
         self.config = config
+        self.use_opp_prior = bool(getattr(config, "use_opp_prior", False))
+        self.opp_prior_weight = float(getattr(config, "opp_prior_weight", 1.0))
+        self.opp_prior_head = None
+        self.opp_loss = None
+        if self.use_opp_prior:
+            opp_feature_keys = list(getattr(config, "opp_prior_feature_keys", self.feature_order))
+            self.opp_prior_head = ObjectPriorHead(int(embed_dim), opp_feature_keys)
+            self.opp_loss = OPPLoss()
         self.adapter.requires_grad_(True)
         self.backbone.requires_grad_(False)
         for module in self.backbone.modules():
@@ -105,6 +114,16 @@ class DinoMask2Former(torch.nn.Module):
         class_labels: list[torch.Tensor] | None = None,
     ):
         features_dict = self.adapter(pixel_values)
+        opp_loss_raw = None
+        if (
+            self.use_opp_prior
+            and self.opp_prior_head is not None
+            and self.opp_loss is not None
+            and mask_labels is not None
+            and class_labels is not None
+        ):
+            opp_outputs = self.opp_prior_head(features_dict)
+            opp_loss_raw = self.opp_loss(opp_outputs, mask_labels, class_labels)
         features = [
             features_dict[key] for key in self.feature_order if key in features_dict
         ]
@@ -154,6 +173,12 @@ class DinoMask2Former(torch.nn.Module):
             raw_loss_dict = {k: v.detach() for k, v in loss_dict.items()}
             loss_dict = self._weight_detection_losses(loss_dict)
             loss = sum(loss_dict.values())
+
+            if opp_loss_raw is not None:
+                raw_loss_dict["loss_opp_prior"] = opp_loss_raw.detach()
+                weighted_opp = opp_loss_raw * self.opp_prior_weight
+                loss = loss + weighted_opp
+                loss_dict["loss_opp_prior"] = weighted_opp
 
             if self.depth_loss_enabled:
                 depth_loss_raw = self._compute_depth_loss(

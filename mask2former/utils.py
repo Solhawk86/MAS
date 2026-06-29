@@ -75,6 +75,11 @@ def build_mask2former_config(
         config.depth_loss_weight = 0.0
         config.depth_diversity_weight = 0.0
     config.use_depth_embedding = use_depth_embedding
+    config.use_opp_prior = bool(mask2former_cfg.get("use_opp_prior", False))
+    config.opp_prior_weight = float(mask2former_cfg.get("opp_prior_weight", 1.0))
+    config.opp_prior_feature_keys = list(
+        mask2former_cfg.get("opp_prior_feature_keys", mask2former_cfg["feature_order"])
+    )
 
     transforms_cfg = dataset_cfg["transforms"] if dataset_cfg else {}
     mean = transforms_cfg["mean"] if transforms_cfg else None
