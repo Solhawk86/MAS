@@ -122,18 +122,6 @@ class DinoMask2Former(torch.nn.Module):
         features_dict = self.adapter(pixel_values)
         fg_bg_cosine_raw = None
         fg_bg_cosine_metrics: dict[str, torch.Tensor] = {}
-        if (
-            self.use_fg_bg_cosine_loss
-            and self.fg_bg_cosine_loss is not None
-            and mask_labels is not None
-            and class_labels is not None
-        ):
-            fg_bg_cosine_raw, fg_bg_cosine_metrics = self.fg_bg_cosine_loss(
-                features_dict,
-                mask_labels,
-                class_labels,
-                return_metrics=True,
-            )
         features = [
             features_dict[key] for key in self.feature_order if key in features_dict
         ]
@@ -151,6 +139,18 @@ class DinoMask2Former(torch.nn.Module):
             output_attentions=self.config.output_attentions,
             return_dict=True,
         )
+        if (
+            self.use_fg_bg_cosine_loss
+            and self.fg_bg_cosine_loss is not None
+            and mask_labels is not None
+            and class_labels is not None
+        ):
+            fg_bg_cosine_raw, fg_bg_cosine_metrics = self.fg_bg_cosine_loss(
+                decoder_out.mask_features,
+                mask_labels,
+                class_labels,
+                return_metrics=True,
+            )
         transformer_out = self.transformer_module(
             multi_scale_features=list(decoder_out.multi_scale_features),
             mask_features=decoder_out.mask_features,

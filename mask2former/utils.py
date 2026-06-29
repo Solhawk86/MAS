@@ -82,7 +82,7 @@ def build_mask2former_config(
         mask2former_cfg.get("fg_bg_cosine_weight", 0.05)
     )
     config.fg_bg_cosine_feature_keys = list(
-        mask2former_cfg.get("fg_bg_cosine_feature_keys", ["2", "3", "4"])
+        mask2former_cfg.get("fg_bg_cosine_feature_keys", [])
     )
     config.fg_bg_cosine_margin = float(
         mask2former_cfg.get("fg_bg_cosine_margin", 0.0)

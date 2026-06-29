@@ -23,12 +23,16 @@ class ForegroundBackgroundPrototypeCosineLoss(nn.Module):
 
     def forward(
         self,
-        features: Mapping[str, torch.Tensor],
+        features: Mapping[str, torch.Tensor] | torch.Tensor,
         mask_labels: Sequence[torch.Tensor],
         class_labels: Sequence[torch.Tensor],
         return_metrics: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        fused = self._fuse_features(features)
+        fused = (
+            features
+            if isinstance(features, torch.Tensor)
+            else self._fuse_features(features)
+        )
         targets = self._build_foreground_targets(mask_labels, class_labels)
 
         total = fused.new_tensor(0.0)

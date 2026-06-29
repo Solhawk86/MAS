@@ -122,10 +122,6 @@ mask2former:
   num_queries: 60
   use_fg_bg_cosine_loss: true
   fg_bg_cosine_weight: 1
-  fg_bg_cosine_feature_keys:
-  - '2'
-  - '3'
-  - '4'
   fg_bg_cosine_margin: 0.0
   use_depth_embedding: true
   depth_num_groups: 3
