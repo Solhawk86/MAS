@@ -1,22 +1,10 @@
 from __future__ import annotations
 
-from typing import Mapping, Sequence
+from typing import Sequence
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
-class ObjectPriorHead(nn.Module):
-    def __init__(self, in_channels: int, feature_keys: Sequence[str]):
-        super().__init__()
-        self.feature_keys = list(feature_keys)
-        self.heads = nn.ModuleDict(
-            {key: nn.Conv2d(in_channels, 1, kernel_size=1, stride=1, padding=0) for key in self.feature_keys}
-        )
-
-    def forward(self, features: Mapping[str, torch.Tensor]) -> list[torch.Tensor]:
-        return [torch.sigmoid(self.heads[key](features[key])) for key in self.feature_keys if key in features]
 
 
 class OPPLoss(nn.Module):
@@ -29,18 +17,15 @@ class OPPLoss(nn.Module):
 
     def forward(
         self,
-        inputs: Sequence[torch.Tensor],
+        inputs: torch.Tensor,
         mask_labels: Sequence[torch.Tensor],
         class_labels: Sequence[torch.Tensor],
     ) -> torch.Tensor:
-        if not inputs:
-            raise ValueError("OPPLoss received no prior logits")
+        if inputs.ndim != 4:
+            raise ValueError(f"OPPLoss expects [B, C, H, W] logits, got {tuple(inputs.shape)}")
 
         targets = self._build_foreground_targets(mask_labels, class_labels)
-        total_loss = inputs[0].new_tensor(0.0)
-        for logits in inputs:
-            total_loss = total_loss + self._loss_single_level(logits, targets)
-        return total_loss / len(inputs)
+        return self._loss_single_level(inputs, targets)
 
     def _build_foreground_targets(
         self,
@@ -89,17 +74,19 @@ class OPPLoss(nn.Module):
 
     def _bce_dice_loss(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         bce = self.bce_loss_fn(inputs, targets)
-        inter = (inputs * targets).sum()
+        probs = inputs.sigmoid()
+        inter = (probs * targets).sum()
         eps = 1e-5
-        dice = (2 * inter + eps) / (inputs.sum() + targets.sum() + eps)
+        dice = (2 * inter + eps) / (probs.sum() + targets.sum() + eps)
         return bce + (1 - dice.mean())
 
     def _cross_entropy_loss(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         return self.bce_loss_fn(inputs, targets)
 
     def _f_loss(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        probs = inputs.sigmoid()
         target = targets.squeeze(1)
-        prediction = inputs.squeeze(1)
+        prediction = probs.squeeze(1)
         eps = 1e-10
         batch_size = prediction.size(0)
         true_positive = (prediction * target).view(batch_size, -1).sum(dim=1)

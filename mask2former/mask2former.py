@@ -13,7 +13,7 @@ from transformers.models.mask2former.modeling_mask2former import (
 
 from MAS.loss import LaplacianClarity, QueryDepthConsistencyLoss
 from MAS.mask2former.depth_transformer import DepthAwareMask2FormerTransformerModule
-from MAS.mask2former.opp_prior import ObjectPriorHead, OPPLoss
+from MAS.mask2former.opp_prior import OPPLoss
 
 
 class DinoMask2Former(torch.nn.Module):
@@ -60,11 +60,8 @@ class DinoMask2Former(torch.nn.Module):
         self.config = config
         self.use_opp_prior = bool(getattr(config, "use_opp_prior", False))
         self.opp_prior_weight = float(getattr(config, "opp_prior_weight", 1.0))
-        self.opp_prior_head = None
         self.opp_loss = None
         if self.use_opp_prior:
-            opp_feature_keys = list(getattr(config, "opp_prior_feature_keys", self.feature_order))
-            self.opp_prior_head = ObjectPriorHead(int(embed_dim), opp_feature_keys)
             self.opp_loss = OPPLoss()
         self.adapter.requires_grad_(True)
         self.backbone.requires_grad_(False)
@@ -114,16 +111,16 @@ class DinoMask2Former(torch.nn.Module):
         class_labels: list[torch.Tensor] | None = None,
     ):
         features_dict = self.adapter(pixel_values)
+        opp_logits = features_dict.pop("_opp_logits", None)
         opp_loss_raw = None
         if (
             self.use_opp_prior
-            and self.opp_prior_head is not None
             and self.opp_loss is not None
+            and opp_logits is not None
             and mask_labels is not None
             and class_labels is not None
         ):
-            opp_outputs = self.opp_prior_head(features_dict)
-            opp_loss_raw = self.opp_loss(opp_outputs, mask_labels, class_labels)
+            opp_loss_raw = self.opp_loss(opp_logits, mask_labels, class_labels)
         features = [
             features_dict[key] for key in self.feature_order if key in features_dict
         ]

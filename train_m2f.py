@@ -45,6 +45,7 @@ from MAS.model.backbone_utils import build_backbone
 from MAS.utils import _distributed_mean, _setup_device_and_distributed, load_config
 from MAS.mask2former.utils import *
 from MAS.mask2former.mask2former import DinoMask2Former
+from MAS.model.opp_dinov3_adapter import DINOv3OPPAdapter
 from dinov3.eval.segmentation.models.backbone.dinov3_adapter import DINOv3_Adapter
 from MAS.mask2former.utils import (
     _as_dtype,
@@ -464,7 +465,8 @@ def main() -> None:
 
     backbone = build_backbone(cfg, device)
     indices = resolve_interaction_indices(backbone, cfg)
-    adapter = DINOv3_Adapter(backbone, interaction_indexes=indices).to(device)
+    adapter_cls = DINOv3OPPAdapter if bool(cfg["mask2former"].get("use_opp_prior", False)) else DINOv3_Adapter
+    adapter = adapter_cls(backbone, interaction_indexes=indices).to(device)
     model = DinoMask2Former(adapter, mask2former_config, feature_order).to(device)
     if rank == 0:
         unwrapped = _unwrap(model)
