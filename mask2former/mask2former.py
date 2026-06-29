@@ -13,6 +13,7 @@ from transformers.models.mask2former.modeling_mask2former import (
 
 from MAS.loss import LaplacianClarity, QueryDepthConsistencyLoss
 from MAS.mask2former.depth_transformer import DepthAwareMask2FormerTransformerModule
+from MAS.mask2former.fg_bg_cosine import ForegroundBackgroundPrototypeCosineLoss
 
 
 class DinoMask2Former(torch.nn.Module):
@@ -57,6 +58,20 @@ class DinoMask2Former(torch.nn.Module):
             weight_dict=self.loss_weights,
         )
         self.config = config
+        self.use_fg_bg_cosine_loss = bool(
+            getattr(config, "use_fg_bg_cosine_loss", False)
+        )
+        self.fg_bg_cosine_weight = float(
+            getattr(config, "fg_bg_cosine_weight", 0.05)
+        )
+        self.fg_bg_cosine_loss = None
+        if self.use_fg_bg_cosine_loss:
+            self.fg_bg_cosine_loss = ForegroundBackgroundPrototypeCosineLoss(
+                feature_keys=list(
+                    getattr(config, "fg_bg_cosine_feature_keys", ["2", "3", "4"])
+                ),
+                margin=float(getattr(config, "fg_bg_cosine_margin", 0.0)),
+            )
         self.adapter.requires_grad_(True)
         self.backbone.requires_grad_(False)
         for module in self.backbone.modules():
@@ -105,6 +120,18 @@ class DinoMask2Former(torch.nn.Module):
         class_labels: list[torch.Tensor] | None = None,
     ):
         features_dict = self.adapter(pixel_values)
+        fg_bg_cosine_raw = None
+        if (
+            self.use_fg_bg_cosine_loss
+            and self.fg_bg_cosine_loss is not None
+            and mask_labels is not None
+            and class_labels is not None
+        ):
+            fg_bg_cosine_raw = self.fg_bg_cosine_loss(
+                features_dict,
+                mask_labels,
+                class_labels,
+            )
         features = [
             features_dict[key] for key in self.feature_order if key in features_dict
         ]
@@ -154,6 +181,14 @@ class DinoMask2Former(torch.nn.Module):
             raw_loss_dict = {k: v.detach() for k, v in loss_dict.items()}
             loss_dict = self._weight_detection_losses(loss_dict)
             loss = sum(loss_dict.values())
+
+            if fg_bg_cosine_raw is not None:
+                raw_loss_dict["loss_fg_bg_cosine"] = fg_bg_cosine_raw.detach()
+                weighted_fg_bg_cosine = (
+                    fg_bg_cosine_raw * self.fg_bg_cosine_weight
+                )
+                loss = loss + weighted_fg_bg_cosine
+                loss_dict["loss_fg_bg_cosine"] = weighted_fg_bg_cosine
 
             if self.depth_loss_enabled:
                 depth_loss_raw = self._compute_depth_loss(

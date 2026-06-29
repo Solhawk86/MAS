@@ -180,6 +180,7 @@ def train_one_epoch(
                         "loss_mask",
                         "loss_dice",
                         "loss_cross_entropy",
+                        "loss_fg_bg_cosine",
                         "depth_loss",
                     )
                     if k in raw_losses
