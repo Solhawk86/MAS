@@ -26,11 +26,13 @@ class ForegroundBackgroundPrototypeCosineLoss(nn.Module):
         features: Mapping[str, torch.Tensor],
         mask_labels: Sequence[torch.Tensor],
         class_labels: Sequence[torch.Tensor],
-    ) -> torch.Tensor:
+        return_metrics: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
         fused = self._fuse_features(features)
         targets = self._build_foreground_targets(mask_labels, class_labels)
 
         total = fused.new_tensor(0.0)
+        cos_total = fused.new_tensor(0.0)
         valid = 0
         target_size = fused.shape[-2:]
         for image_idx, target in enumerate(targets):
@@ -60,11 +62,27 @@ class ForegroundBackgroundPrototypeCosineLoss(nn.Module):
             )
             cos = (fg_proto * bg_proto).sum(dim=1)
             total = total + F.relu(cos - self.margin).mean()
+            cos_total = cos_total + cos.mean()
             valid += 1
 
         if valid == 0:
+            metrics = {
+                "fg_bg_cos": total.detach(),
+                "fg_bg_separation": total.detach(),
+            }
+            if return_metrics:
+                return total, metrics
             return total
-        return total / valid
+
+        loss = total / valid
+        mean_cos = cos_total / valid
+        metrics = {
+            "fg_bg_cos": mean_cos.detach(),
+            "fg_bg_separation": (1.0 - mean_cos).detach(),
+        }
+        if return_metrics:
+            return loss, metrics
+        return loss
 
     def _fuse_features(self, features: Mapping[str, torch.Tensor]) -> torch.Tensor:
         missing = [key for key in self.feature_keys if key not in features]

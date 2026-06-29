@@ -84,7 +84,9 @@ def _infer_dataset_name(dataset_cfg: dict) -> str:
             # /.../<dataset>/train/<images>
             candidate = parts[-3]
         else:
-            candidate = train_images_path.parent.parent.name or train_images_path.parent.name
+            candidate = (
+                train_images_path.parent.parent.name or train_images_path.parent.name
+            )
         candidate = str(candidate).strip().lower()
         if candidate:
             return re.sub(r"[^A-Za-z0-9_.-]+", "_", candidate)
@@ -181,6 +183,8 @@ def train_one_epoch(
                         "loss_dice",
                         "loss_cross_entropy",
                         "loss_fg_bg_cosine",
+                        "fg_bg_cos",
+                        "fg_bg_separation",
                         "depth_loss",
                     )
                     if k in raw_losses
@@ -614,7 +618,7 @@ def main() -> None:
                         )
                     else:
                         logger.log_message(f"新的最佳 mIoU={best_miou:.4f}")
-            if (epoch + 1) % 5 == 0:
+            if (epoch + 1) % 10 == 0:
                 periodic_ckpt_path = logger.checkpoint_dir / f"epoch_{epoch + 1:03d}.pt"
                 save_checkpoint(
                     periodic_ckpt_path,

@@ -121,16 +121,18 @@ class DinoMask2Former(torch.nn.Module):
     ):
         features_dict = self.adapter(pixel_values)
         fg_bg_cosine_raw = None
+        fg_bg_cosine_metrics: dict[str, torch.Tensor] = {}
         if (
             self.use_fg_bg_cosine_loss
             and self.fg_bg_cosine_loss is not None
             and mask_labels is not None
             and class_labels is not None
         ):
-            fg_bg_cosine_raw = self.fg_bg_cosine_loss(
+            fg_bg_cosine_raw, fg_bg_cosine_metrics = self.fg_bg_cosine_loss(
                 features_dict,
                 mask_labels,
                 class_labels,
+                return_metrics=True,
             )
         features = [
             features_dict[key] for key in self.feature_order if key in features_dict
@@ -189,6 +191,9 @@ class DinoMask2Former(torch.nn.Module):
                 )
                 loss = loss + weighted_fg_bg_cosine
                 loss_dict["loss_fg_bg_cosine"] = weighted_fg_bg_cosine
+                for key, value in fg_bg_cosine_metrics.items():
+                    raw_loss_dict[key] = value.detach()
+                    loss_dict[key] = value.detach()
 
             if self.depth_loss_enabled:
                 depth_loss_raw = self._compute_depth_loss(

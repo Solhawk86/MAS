@@ -121,7 +121,7 @@ mask2former:
   common_stride: 4
   num_queries: 60
   use_fg_bg_cosine_loss: true
-  fg_bg_cosine_weight: 0.05
+  fg_bg_cosine_weight: 1
   fg_bg_cosine_feature_keys:
   - '2'
   - '3'
