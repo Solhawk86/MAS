@@ -32,3 +32,5 @@ test_m2f_smoke.py
 piccheck.py
 inspect_mask_instances.py
 batch_eval.py
+feature_cache.py
+visualization/
