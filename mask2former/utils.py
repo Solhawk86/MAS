@@ -75,18 +75,16 @@ def build_mask2former_config(
         config.depth_loss_weight = 0.0
         config.depth_diversity_weight = 0.0
     config.use_depth_embedding = use_depth_embedding
-    config.use_fg_bg_cosine_loss = bool(
-        mask2former_cfg.get("use_fg_bg_cosine_loss", False)
+    config.use_fg_bg_aux_loss = bool(mask2former_cfg.get("use_fg_bg_aux_loss", False))
+    config.fg_bg_aux_weight = float(mask2former_cfg.get("fg_bg_aux_weight", 0.2))
+    config.fg_bg_aux_ce_weight = float(mask2former_cfg.get("fg_bg_aux_ce_weight", 1.0))
+    config.fg_bg_aux_dice_weight = float(
+        mask2former_cfg.get("fg_bg_aux_dice_weight", 1.0)
     )
-    config.fg_bg_cosine_weight = float(
-        mask2former_cfg.get("fg_bg_cosine_weight", 0.05)
+    config.fg_bg_aux_hidden_ratio = float(
+        mask2former_cfg.get("fg_bg_aux_hidden_ratio", 0.5)
     )
-    config.fg_bg_cosine_feature_keys = list(
-        mask2former_cfg.get("fg_bg_cosine_feature_keys", [])
-    )
-    config.fg_bg_cosine_margin = float(
-        mask2former_cfg.get("fg_bg_cosine_margin", 0.0)
-    )
+    config.fg_bg_aux_dropout = float(mask2former_cfg.get("fg_bg_aux_dropout", 0.1))
 
     transforms_cfg = dataset_cfg["transforms"] if dataset_cfg else {}
     mean = transforms_cfg["mean"] if transforms_cfg else None

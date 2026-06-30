@@ -13,7 +13,7 @@ from transformers.models.mask2former.modeling_mask2former import (
 
 from MAS.loss import LaplacianClarity, QueryDepthConsistencyLoss
 from MAS.mask2former.depth_transformer import DepthAwareMask2FormerTransformerModule
-from MAS.mask2former.fg_bg_cosine import ForegroundBackgroundPrototypeCosineLoss
+from MAS.mask2former.fg_bg_aux import ForegroundBackgroundAuxiliaryHead
 
 
 class DinoMask2Former(torch.nn.Module):
@@ -58,19 +58,20 @@ class DinoMask2Former(torch.nn.Module):
             weight_dict=self.loss_weights,
         )
         self.config = config
-        self.use_fg_bg_cosine_loss = bool(
-            getattr(config, "use_fg_bg_cosine_loss", False)
+        self.use_fg_bg_aux_loss = bool(
+            getattr(config, "use_fg_bg_aux_loss", False)
         )
-        self.fg_bg_cosine_weight = float(
-            getattr(config, "fg_bg_cosine_weight", 0.05)
+        self.fg_bg_aux_weight = float(
+            getattr(config, "fg_bg_aux_weight", 0.2)
         )
-        self.fg_bg_cosine_loss = None
-        if self.use_fg_bg_cosine_loss:
-            self.fg_bg_cosine_loss = ForegroundBackgroundPrototypeCosineLoss(
-                feature_keys=list(
-                    getattr(config, "fg_bg_cosine_feature_keys", ["2", "3", "4"])
-                ),
-                margin=float(getattr(config, "fg_bg_cosine_margin", 0.0)),
+        self.fg_bg_aux_head = None
+        if self.use_fg_bg_aux_loss:
+            self.fg_bg_aux_head = ForegroundBackgroundAuxiliaryHead(
+                in_channels=int(config.mask_feature_size),
+                hidden_ratio=float(getattr(config, "fg_bg_aux_hidden_ratio", 0.5)),
+                dropout=float(getattr(config, "fg_bg_aux_dropout", 0.1)),
+                ce_weight=float(getattr(config, "fg_bg_aux_ce_weight", 1.0)),
+                dice_weight=float(getattr(config, "fg_bg_aux_dice_weight", 1.0)),
             )
         self.adapter.requires_grad_(True)
         self.backbone.requires_grad_(False)
@@ -120,8 +121,8 @@ class DinoMask2Former(torch.nn.Module):
         class_labels: list[torch.Tensor] | None = None,
     ):
         features_dict = self.adapter(pixel_values)
-        fg_bg_cosine_raw = None
-        fg_bg_cosine_metrics: dict[str, torch.Tensor] = {}
+        fg_bg_aux_raw = None
+        fg_bg_aux_metrics: dict[str, torch.Tensor] = {}
         features = [
             features_dict[key] for key in self.feature_order if key in features_dict
         ]
@@ -140,16 +141,15 @@ class DinoMask2Former(torch.nn.Module):
             return_dict=True,
         )
         if (
-            self.use_fg_bg_cosine_loss
-            and self.fg_bg_cosine_loss is not None
+            self.use_fg_bg_aux_loss
+            and self.fg_bg_aux_head is not None
             and mask_labels is not None
             and class_labels is not None
         ):
-            fg_bg_cosine_raw, fg_bg_cosine_metrics = self.fg_bg_cosine_loss(
+            fg_bg_aux_raw, fg_bg_aux_metrics = self.fg_bg_aux_head(
                 decoder_out.mask_features,
                 mask_labels,
                 class_labels,
-                return_metrics=True,
             )
         transformer_out = self.transformer_module(
             multi_scale_features=list(decoder_out.multi_scale_features),
@@ -184,14 +184,12 @@ class DinoMask2Former(torch.nn.Module):
             loss_dict = self._weight_detection_losses(loss_dict)
             loss = sum(loss_dict.values())
 
-            if fg_bg_cosine_raw is not None:
-                raw_loss_dict["loss_fg_bg_cosine"] = fg_bg_cosine_raw.detach()
-                weighted_fg_bg_cosine = (
-                    fg_bg_cosine_raw * self.fg_bg_cosine_weight
-                )
-                loss = loss + weighted_fg_bg_cosine
-                loss_dict["loss_fg_bg_cosine"] = weighted_fg_bg_cosine
-                for key, value in fg_bg_cosine_metrics.items():
+            if fg_bg_aux_raw is not None:
+                raw_loss_dict["loss_fg_bg_aux"] = fg_bg_aux_raw.detach()
+                weighted_fg_bg_aux = fg_bg_aux_raw * self.fg_bg_aux_weight
+                loss = loss + weighted_fg_bg_aux
+                loss_dict["loss_fg_bg_aux"] = weighted_fg_bg_aux
+                for key, value in fg_bg_aux_metrics.items():
                     raw_loss_dict[key] = value.detach()
                     loss_dict[key] = value.detach()
 

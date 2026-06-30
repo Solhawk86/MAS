@@ -182,9 +182,11 @@ def train_one_epoch(
                         "loss_mask",
                         "loss_dice",
                         "loss_cross_entropy",
-                        "loss_fg_bg_cosine",
-                        "fg_bg_cos",
-                        "fg_bg_separation",
+                        "loss_fg_bg_aux",
+                        "loss_fg_bg_ce",
+                        "loss_fg_bg_dice",
+                        "fg_bg_aux_acc",
+                        "fg_bg_aux_fg_iou",
                         "depth_loss",
                     )
                     if k in raw_losses
