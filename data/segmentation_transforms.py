@@ -80,7 +80,7 @@ class PhotoMetricDistortion(torch.nn.Module):
             img = img_tensor.permute((1, 2, 0)).numpy()
         return img
 
-    def forward(self, img, label) -> Tuple[torch.Tensor, Any]:
+    def forward(self, img, label, depth=None, depth_valid=None) -> Tuple[torch.Tensor, Any]:
         """Transform function to perform photometric distortion on images."""
         # Operations need numpy arrays
         img = img.permute((1, 2, 0)).numpy()
@@ -98,7 +98,10 @@ class PhotoMetricDistortion(torch.nn.Module):
         # random contrast
         if mode == 0:
             img = self.contrast(img)
-        return torch.tensor(img.astype(np.float32)).permute((2, 0, 1)), label
+        img = torch.tensor(img.astype(np.float32)).permute((2, 0, 1))
+        if depth is None and depth_valid is None:
+            return img, label
+        return img, label, depth, depth_valid
 
 
 class ReduceZeroLabel(torch.nn.Module):
@@ -108,9 +111,11 @@ class ReduceZeroLabel(torch.nn.Module):
         super().__init__()
         self.ignore_index = ignore_index
 
-    def forward(self, img, label):
+    def forward(self, img, label, depth=None, depth_valid=None):
         label = preprocess_nonzero_labels(label, ignore_index=self.ignore_index)
-        return img, label
+        if depth is None and depth_valid is None:
+            return img, label
+        return img, label, depth, depth_valid
 
 
 class MaybeApplyImageLabel(torch.nn.Module):
@@ -127,11 +132,18 @@ class MaybeApplyImageLabel(torch.nn.Module):
         self._transform = transform
         self._threshold = threshold
 
-    def __call__(self, img, label):
+    def __call__(self, img, label, depth=None, depth_valid=None):
         x = np.random.rand()
         if x < self._threshold:
-            return self._transform(img), self._transform(label)
-        return img, label
+            img = self._transform(img)
+            label = self._transform(label)
+            if depth is not None:
+                depth = self._transform(depth)
+            if depth_valid is not None:
+                depth_valid = self._transform(depth_valid)
+        if depth is None and depth_valid is None:
+            return img, label
+        return img, label, depth, depth_valid
 
 
 class FixedSideResize:
@@ -174,7 +186,7 @@ class FixedSideResize:
         ratio = np.random.random_sample() * (max_ratio - min_ratio) + min_ratio
         return int(self.small_size * ratio)
 
-    def _resize(self, img, label, small_size):
+    def _resize(self, img, label, small_size, depth=None, depth_valid=None):
         init_width, init_height = img.size
         if init_height > init_width:
             new_width = small_size
@@ -186,14 +198,27 @@ class FixedSideResize:
         img = T.Resize(size=(new_height, new_width), interpolation=self.image_interpolation)(img)
         if self.inference_mode == "whole":
             label = T.Resize(size=(new_height, new_width), interpolation=self.label_interpolation)(label)
-        return img, label
+        if depth is not None:
+            depth = T.Resize(
+                size=(new_height, new_width),
+                interpolation=T.InterpolationMode.BILINEAR,
+                antialias=True,
+            )(depth)
+        if depth_valid is not None:
+            depth_valid = T.Resize(
+                size=(new_height, new_width),
+                interpolation=T.InterpolationMode.NEAREST,
+            )(depth_valid)
+        if depth is None and depth_valid is None:
+            return img, label
+        return img, label, depth, depth_valid
 
-    def __call__(self, img, label):
+    def __call__(self, img, label, depth=None, depth_valid=None):
         if not self.use_tta:
             small_size = self.small_size
             if self.random_img_size_ratio_range:
                 small_size = self._random_sample_ratio()
-            return self._resize(img, label, small_size)
+            return self._resize(img, label, small_size, depth, depth_valid)
 
         tta_img_list = []  # Used only if TTA
         for tta_ratio in self.tta_img_size_ratio_range:
@@ -215,10 +240,23 @@ class ResizeV2:
         self.image_interpolation = image_interpolation
         self.label_interpolation = label_interpolation
 
-    def __call__(self, img, label):
+    def __call__(self, img, label, depth=None, depth_valid=None):
         img = T.Resize(size=self.size, interpolation=self.image_interpolation)(img)
         label = T.Resize(size=self.size, interpolation=self.label_interpolation)(label)
-        return img, label
+        if depth is not None:
+            depth = T.Resize(
+                size=self.size,
+                interpolation=T.InterpolationMode.BILINEAR,
+                antialias=True,
+            )(depth)
+        if depth_valid is not None:
+            depth_valid = T.Resize(
+                size=self.size,
+                interpolation=T.InterpolationMode.NEAREST,
+            )(depth_valid)
+        if depth is None and depth_valid is None:
+            return img, label
+        return img, label, depth, depth_valid
 
 
 class CustomResize(torch.nn.Module):
@@ -250,8 +288,8 @@ class CustomResize(torch.nn.Module):
                 label_interpolation=label_interpolation,
             )
 
-    def forward(self, img, label):
-        return self.resize_function(img, label)
+    def forward(self, img, label, depth=None, depth_valid=None):
+        return self.resize_function(img, label, depth, depth_valid)
 
 
 class RandomCropWithLabel(torch.nn.Module):
@@ -290,7 +328,7 @@ class RandomCropWithLabel(torch.nn.Module):
         img = img[:, crop_y1:crop_y2, crop_x1:crop_x2]
         return img
 
-    def forward(self, img, label):
+    def forward(self, img, label, depth=None, depth_valid=None):
         """Find an adequate crop for a given image and crop it"""
         # Create a random crop_bbox
         new_crop_bbox = self.get_crop_bbox(img)
@@ -306,7 +344,15 @@ class RandomCropWithLabel(torch.nn.Module):
                     break
                 new_crop_bbox = self.get_crop_bbox(img)
 
-        return self.crop(img, new_crop_bbox), self.crop(label, new_crop_bbox)
+        img = self.crop(img, new_crop_bbox)
+        label = self.crop(label, new_crop_bbox)
+        if depth is not None:
+            depth = self.crop(depth, new_crop_bbox)
+        if depth_valid is not None:
+            depth_valid = self.crop(depth_valid, new_crop_bbox)
+        if depth is None and depth_valid is None:
+            return img, label
+        return img, label, depth, depth_valid
 
 
 class HorizontalFlipAug(torch.nn.Module):
@@ -342,7 +388,7 @@ class PadTensor(torch.nn.Module):
         self.img_pad_value = img_pad_value
         self.label_pad_value = label_pad_value
 
-    def forward(self, img, label):
+    def forward(self, img, label, depth=None, depth_valid=None):
         h, w = img.shape[-2:]
         new_h, new_w = self.pad_shape[0] - h, self.pad_shape[1] - w
         img = F.pad(input=img, pad=(0, new_w, 0, new_h), mode="constant", value=self.img_pad_value)
@@ -351,7 +397,13 @@ class PadTensor(torch.nn.Module):
         if label.dtype != torch.long:
             label = label.to(torch.long)
         label = F.pad(input=label, pad=(0, new_w, 0, new_h), mode="constant", value=self.label_pad_value)
-        return img, label
+        if depth is not None:
+            depth = F.pad(input=depth, pad=(0, new_w, 0, new_h), mode="constant", value=0.0)
+        if depth_valid is not None:
+            depth_valid = F.pad(input=depth_valid.float(), pad=(0, new_w, 0, new_h), mode="constant", value=0.0)
+        if depth is None and depth_valid is None:
+            return img, label
+        return img, label, depth, depth_valid
 
 
 class NormalizeImage(torch.nn.Module):
@@ -359,8 +411,11 @@ class NormalizeImage(torch.nn.Module):
         super().__init__()
         self.normalize_function = make_normalize_transform(mean=mean, std=std)
 
-    def forward(self, img, label):
-        return self.normalize_function(img.float()), label
+    def forward(self, img, label, depth=None, depth_valid=None):
+        img = self.normalize_function(img.float())
+        if depth is None and depth_valid is None:
+            return img, label
+        return img, label, depth, depth_valid
 
 
 class TransformImages(torch.nn.Module):
@@ -374,22 +429,57 @@ class TransformImages(torch.nn.Module):
         super().__init__()
         self._transforms = transforms
 
-    def forward(self, img, label):
+    def forward(self, img, label, depth=None, depth_valid=None):
         if isinstance(img, (torch.Tensor, Image.Image)):
             img = [img]
         for transform in self._transforms:
             # only apply transforms on the augmented images
             img = [transform(im, label)[0] for im in img]
-        return img, label
+        if depth is not None and not torch.is_tensor(depth):
+            depth = Fv.pil_to_tensor(depth).float()
+        if depth_valid is not None and not torch.is_tensor(depth_valid):
+            depth_valid = Fv.pil_to_tensor(depth_valid).float()
+        if depth is None and depth_valid is None:
+            return img, label
+        return img, label, depth, depth_valid
 
 
 class MaskToTensor(torch.nn.Module):
     """Read segmentation mask from arrays or PIL images"""
 
-    def forward(self, img, label):
+    def forward(self, img, label, depth=None, depth_valid=None):
         if isinstance(label, np.ndarray):
-            return img, Mask(label).permute(2, 0, 1)
-        return img, Mask(label)
+            label = Mask(label).permute(2, 0, 1)
+        else:
+            label = Mask(label)
+        if depth is None and depth_valid is None:
+            return img, label
+        return img, label, depth, depth_valid
+
+
+class PILImageMaskDepthToTensor(torch.nn.Module):
+    """Convert train image/mask/depth inputs to tensors without changing geometry."""
+
+    def forward(self, img, label, depth=None, depth_valid=None):
+        if not torch.is_tensor(img):
+            img = Fv.pil_to_tensor(img)
+        if not torch.is_tensor(label):
+            label = Fv.pil_to_tensor(label)
+        if depth is not None:
+            if not torch.is_tensor(depth):
+                depth = Fv.pil_to_tensor(depth).float()
+            depth = depth.float()
+            if depth.ndim == 2:
+                depth = depth.unsqueeze(0)
+        if depth_valid is not None:
+            if not torch.is_tensor(depth_valid):
+                depth_valid = Fv.pil_to_tensor(depth_valid).float()
+            depth_valid = depth_valid.float()
+            if depth_valid.ndim == 2:
+                depth_valid = depth_valid.unsqueeze(0)
+        if depth is None and depth_valid is None:
+            return img, label
+        return img, label, depth, depth_valid
 
 
 def make_segmentation_train_transforms(
@@ -419,7 +509,7 @@ def make_segmentation_train_transforms(
             )
         )
     # Conversion to torch.Tensor
-    transforms_list.extend([v2.PILToTensor()])
+    transforms_list.extend([PILImageMaskDepthToTensor()])
 
     # Reducing zero labels
     if reduce_zero_label:

@@ -79,9 +79,13 @@ class SegmentationFolderDataset(TorchDataset):
         *,
         keep_image_lists: bool = False,
         ignore_index: Optional[int] = None,
+        depth_dir: Path | None = None,
+        require_depth: bool = False,
     ):
         self.image_dir = image_dir
         self.mask_dir = mask_dir
+        self.depth_dir = depth_dir
+        self.require_depth = require_depth
         self.transforms = transforms
         self.keep_image_lists = keep_image_lists
         self.ignore_index = ignore_index
@@ -92,6 +96,22 @@ class SegmentationFolderDataset(TorchDataset):
             raise ValueError(f"在 {image_dir} 与 {mask_dir} 中找不到匹配文件")
         self.image_paths = [image_map[k] for k in common]
         self.mask_paths = [mask_map[k] for k in common]
+        self.depth_paths: list[Path | None] = [None] * len(common)
+        self.depth_missing_stems: list[str] = []
+        self.depth_matched_count = 0
+        if depth_dir is not None:
+            depth_map = self._scan(depth_dir, {"pt", "pth"})
+            self.depth_paths = [depth_map.get(k) for k in common]
+            self.depth_missing_stems = [
+                k for k, path in zip(common, self.depth_paths) if path is None
+            ]
+            self.depth_matched_count = len(common) - len(self.depth_missing_stems)
+            if require_depth and self.depth_missing_stems:
+                preview = ", ".join(self.depth_missing_stems[:5])
+                raise ValueError(
+                    f"depth cache 缺失 {len(self.depth_missing_stems)} 个样本，"
+                    f"depth_dir={depth_dir}，示例: {preview}"
+                )
 
     @staticmethod
     def _scan(directory: Path, extensions: Iterable[str]) -> Dict[str, Path]:
@@ -109,11 +129,45 @@ class SegmentationFolderDataset(TorchDataset):
         mask = Image.open(self.mask_paths[idx])
         orig_size = torch.tensor((mask.height, mask.width), dtype=torch.long)
         file_name = self.image_paths[idx].stem
-        image, mask = self.transforms(image, mask)
+        depth_tensor = None
+        depth_valid = None
+        if self.depth_dir is not None:
+            depth_path = self.depth_paths[idx]
+            if depth_path is None:
+                if self.require_depth:
+                    raise FileNotFoundError(f"样本 {file_name} 缺少 depth cache")
+            else:
+                depth_tensor = self._load_depth_tensor(depth_path)
+                depth_valid = torch.isfinite(depth_tensor).to(torch.float32)
+                depth_tensor = torch.nan_to_num(depth_tensor.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        if depth_tensor is None:
+            image, mask = self.transforms(image, mask)
+        else:
+            image, mask, depth_tensor, depth_valid = self.transforms(
+                image, mask, depth_tensor, depth_valid
+            )
         image_tensor = self._prepare_image_tensor(image)
         mask_tensor = self._ensure_long_mask(mask)
         mask_tensor = normalize_binary_mask(mask_tensor, ignore_index=self.ignore_index)
-        return image_tensor, mask_tensor, idx, orig_size, file_name
+        if depth_tensor is None:
+            return image_tensor, mask_tensor, idx, orig_size, file_name
+        depth_tensor = self._ensure_depth_tensor(depth_tensor)
+        depth_valid = self._ensure_depth_tensor(depth_valid).clamp(0, 1)
+        return image_tensor, mask_tensor, idx, orig_size, file_name, depth_tensor, depth_valid
+
+    @staticmethod
+    def _load_depth_tensor(path: Path) -> torch.Tensor:
+        sample = torch.load(path, map_location="cpu", weights_only=True)
+        depth = sample.get("depth") if isinstance(sample, dict) else sample
+        if not torch.is_tensor(depth):
+            depth = torch.as_tensor(depth)
+        if depth.ndim == 2:
+            depth = depth.unsqueeze(0)
+        if depth.ndim == 3 and depth.shape[0] != 1:
+            depth = depth[:1]
+        if depth.ndim != 3:
+            raise ValueError(f"depth cache {path} 形状非法: {tuple(depth.shape)}")
+        return depth.float()
 
     def _prepare_image_tensor(self, image: Any) -> Any:
         if isinstance(image, list):
@@ -133,6 +187,15 @@ class SegmentationFolderDataset(TorchDataset):
         if tensor.ndim == 3 and tensor.shape[0] == 1:
             tensor = tensor.squeeze(0)
         return tensor.long()
+
+    @staticmethod
+    def _ensure_depth_tensor(depth: Any) -> torch.Tensor:
+        tensor = torch.as_tensor(depth) if not isinstance(depth, torch.Tensor) else depth
+        if tensor.ndim == 2:
+            tensor = tensor.unsqueeze(0)
+        if tensor.ndim == 3 and tensor.shape[0] != 1:
+            tensor = tensor[:1]
+        return tensor.float()
 
 
 def normalize_binary_mask(
@@ -276,11 +339,25 @@ def build_segmentation_datasets_from_cfg(dataset_cfg: dict):
     train_images, train_masks, val_images, val_masks = _resolve_dataset_paths(
         dataset_cfg
     )
+    train_depths = dataset_cfg.get("train_depths")
+    val_depths = dataset_cfg.get("val_depths")
+    train_depth_dir = Path(train_depths).expanduser() if train_depths else None
+    val_depth_dir = Path(val_depths).expanduser() if val_depths else None
     train_dataset = SegmentationFolderDataset(
-        train_images, train_masks, train_transforms, ignore_index=ignore_index
+        train_images,
+        train_masks,
+        train_transforms,
+        ignore_index=ignore_index,
+        depth_dir=train_depth_dir,
+        require_depth=train_depth_dir is not None,
     )
     val_dataset = SegmentationFolderDataset(
-        val_images, val_masks, eval_transforms, ignore_index=ignore_index
+        val_images,
+        val_masks,
+        eval_transforms,
+        ignore_index=ignore_index,
+        depth_dir=val_depth_dir,
+        require_depth=val_depth_dir is not None,
     )
     train_dataset = _maybe_apply_few_shot_subset(train_dataset, dataset_cfg)
     return train_dataset, val_dataset
@@ -381,6 +458,19 @@ def _maybe_apply_few_shot_subset(
     subset.few_shot_strategy = strategy
     subset.few_shot_selected_indices = indices
     subset.few_shot_selected_stems = selected_stems
+    subset.depth_dir = getattr(train_dataset, "depth_dir", None)
+    subset.depth_matched_count = sum(
+        1
+        for idx in indices
+        if getattr(train_dataset, "depth_paths", [None] * len(train_dataset))[idx]
+        is not None
+    )
+    subset.depth_missing_stems = [
+        train_dataset.image_paths[idx].stem
+        for idx in indices
+        if getattr(train_dataset, "depth_paths", [None] * len(train_dataset))[idx]
+        is None
+    ]
     return subset
 
 
