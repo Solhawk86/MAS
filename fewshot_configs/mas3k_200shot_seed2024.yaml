@@ -38,6 +38,7 @@ backbone:
 dataset:
   train_images: /data/hong/data/MAS3K/train/Image
   train_masks: /data/hong/data/MAS3K/train/Mask
+  train_depths: /data/hong/data/MAS3K/train/dino_depth_vit7b_synthmix_bf16
   val_images: /data/hong/data/MAS3K/test/Image
   val_masks: /data/hong/data/MAS3K/test/binary_label
   num_classes: 2
@@ -72,6 +73,7 @@ dataset:
     num_samples: 200
     seed: 2024
     strategy: category_species_method
+  val_depths: /data/hong/data/MAS3K/test/dino_depth_vit7b_synthmix_bf16
 training:
   device: cuda
   batch_size: 1
@@ -100,6 +102,7 @@ training:
     - 0.9
     - 0.95
     decay_factor: 0.1
+  run_suffix: decoder_depth_ca_g8_c64_gamma1
 mask2former:
   feature_order:
   - '1'
@@ -120,8 +123,6 @@ mask2former:
   enforce_input_projection: false
   common_stride: 4
   num_queries: 60
-  use_depth_embedding: true
-  depth_num_groups: 3
   num_heads: 8
   encoder_layers: 6
   decoder_layers: 9
@@ -129,11 +130,18 @@ mask2former:
   mask_weight: 5.0
   dice_weight: 5.0
   no_object_weight: 0.1
-  depth_loss_weight: 1
-  depth_diversity_weight: 0
   train_num_points: 12544
   oversample_ratio: 3.0
   importance_sample_ratio: 0.75
+  use_decoder_depth_cross_attention: true
+  depth_token_grid: 8
+  depth_token_channels: 64
+  depth_cross_attention_heads: 8
+  depth_cross_attention_dropout: 0.0
+  depth_cross_attention_gamma_mode: fixed
+  depth_cross_attention_gamma: 1.0
+  depth_token_use_edge: true
+  depth_token_use_valid: true
 evaluation:
   pred_dir: predictions
   gt_dir: /data/hong/data/MAS3K/test/binary_label
