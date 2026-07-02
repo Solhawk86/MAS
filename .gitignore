@@ -6,6 +6,8 @@ cosine_similarity/input
 cosine_similarity/output
 **/__pycache__/
 __pycache__/
+*.py[cod]
+*$py.class
 runs
 config_eval.yaml
 weights
