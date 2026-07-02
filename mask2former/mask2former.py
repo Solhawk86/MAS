@@ -11,8 +11,7 @@ from transformers.models.mask2former.modeling_mask2former import (
     Mask2FormerTransformerModule,
 )
 
-from MAS.loss import LaplacianClarity, QueryDepthConsistencyLoss
-from MAS.mask2former.depth_transformer import DepthAwareMask2FormerTransformerModule
+from MAS.mask2former.depth_decoder import DepthAwareMask2FormerTransformerModule
 
 
 class DinoMask2Former(torch.nn.Module):
@@ -35,17 +34,12 @@ class DinoMask2Former(torch.nn.Module):
             config,
             feature_channels=[int(embed_dim)] * len(self.feature_order),
         )
-        self.use_depth_embedding = bool(getattr(config, "use_depth_embedding", True))
-        if self.use_depth_embedding:
-            self.transformer_module = DepthAwareMask2FormerTransformerModule(
-                in_features=config.feature_size,
-                config=config,
-            )
-        else:
-            self.transformer_module = Mask2FormerTransformerModule(
-                in_features=config.feature_size,
-                config=config,
-            )
+        transformer_cls = (
+            DepthAwareMask2FormerTransformerModule
+            if bool(getattr(config, "use_decoder_depth_cross_attention", False))
+            else Mask2FormerTransformerModule
+        )
+        self.transformer_module = transformer_cls(in_features=config.feature_size, config=config)
         self.class_predictor = torch.nn.Linear(config.hidden_dim, config.num_labels + 1)
         self.loss_weights = {
             "loss_cross_entropy": config.class_weight,
@@ -64,26 +58,9 @@ class DinoMask2Former(torch.nn.Module):
                 module.set_lora_requires_grad(True)
         self._logged_feature_info = False
 
-        # depth-aware queries 的额外监督配置
-        self.depth_loss_weight = float(getattr(config, "depth_loss_weight"))
-        depth_groups = int(getattr(config, "depth_num_groups"))
-        depth_div_weight = float(getattr(config, "depth_diversity_weight"))
-        self.depth_loss_enabled = (
-            self.use_depth_embedding
-            and self.depth_loss_weight > 0
-            and depth_groups > 0
+        self.use_decoder_depth_cross_attention = bool(
+            getattr(config, "use_decoder_depth_cross_attention", False)
         )
-        if self.depth_loss_enabled:
-            self.depth_clarity = LaplacianClarity()
-            self.depth_consistency_loss = QueryDepthConsistencyLoss(
-                num_queries=config.num_queries,
-                hidden_dim=config.hidden_dim,
-                num_depth=depth_groups,
-                div_loss_weight=depth_div_weight,
-            )
-        else:
-            self.depth_clarity = None
-            self.depth_consistency_loss = None
 
         mean = getattr(config, "image_normalize_mean", None)
         std = getattr(config, "image_normalize_std", None)
@@ -103,7 +80,11 @@ class DinoMask2Former(torch.nn.Module):
         pixel_values: torch.Tensor,
         mask_labels: list[torch.Tensor] | None = None,
         class_labels: list[torch.Tensor] | None = None,
+        depth_maps: torch.Tensor | None = None,
+        depth_valid: torch.Tensor | None = None,
     ):
+        if self.use_decoder_depth_cross_attention and depth_maps is None:
+            raise ValueError("配置启用了 decoder depth cross-attention，但 forward 未提供 depth_maps")
         features_dict = self.adapter(pixel_values)
         features = [
             features_dict[key] for key in self.feature_order if key in features_dict
@@ -122,12 +103,16 @@ class DinoMask2Former(torch.nn.Module):
             output_attentions=self.config.output_attentions,
             return_dict=True,
         )
-        transformer_out = self.transformer_module(
+        transformer_kwargs = dict(
             multi_scale_features=list(decoder_out.multi_scale_features),
             mask_features=decoder_out.mask_features,
             output_hidden_states=True,
             output_attentions=self.config.output_attentions,
         )
+        if self.use_decoder_depth_cross_attention:
+            transformer_kwargs["depth_maps"] = depth_maps
+            transformer_kwargs["depth_valid"] = depth_valid
+        transformer_out = self.transformer_module(**transformer_kwargs)
         class_queries = tuple(
             self.class_predictor(hidden_state.transpose(0, 1))
             for hidden_state in transformer_out.intermediate_hidden_states
@@ -155,18 +140,11 @@ class DinoMask2Former(torch.nn.Module):
             loss_dict = self._weight_detection_losses(loss_dict)
             loss = sum(loss_dict.values())
 
-            if self.depth_loss_enabled:
-                depth_loss_raw = self._compute_depth_loss(
-                    pixel_values,
-                    masks_queries[-1],
-                    transformer_out.get("depth_latent"),
-                    transformer_out.get("depth_ids"),
-                )
-                if depth_loss_raw is not None:
-                    raw_loss_dict["depth_loss"] = depth_loss_raw.detach()
-                    weighted_depth = depth_loss_raw * self.depth_loss_weight
-                    loss = loss + weighted_depth
-                    loss_dict["depth_loss"] = weighted_depth
+            depth_diagnostics = getattr(transformer_out, "depth_diagnostics", None)
+            if depth_diagnostics:
+                for key, value in depth_diagnostics.items():
+                    raw_loss_dict[key] = value.detach()
+                    loss_dict[key] = value.detach()
         return {
             "loss": loss,
             "loss_dict": loss_dict,
@@ -191,38 +169,3 @@ class DinoMask2Former(torch.nn.Module):
             )
             weighted[key] = value * coeff
         return weighted
-
-    def _recover_images(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        images = pixel_values.detach()
-        if self._image_mean is not None and self._image_std is not None:
-            # 反归一化回原图分布
-            mean = self._image_mean.to(images.device)
-            std = self._image_std.to(images.device)
-            images = images * std + mean
-        if self._images_are_255:
-            images = images / self._image_divisor
-        return images.clamp(0.0, 1.0)
-
-    def _compute_depth_loss(
-        self,
-        pixel_values: torch.Tensor,
-        mask_logits: torch.Tensor,
-        depth_latent: torch.Tensor | None,
-        depth_ids: torch.Tensor | None,
-    ) -> torch.Tensor | None:
-        if (
-            not self.depth_loss_enabled
-            or self.depth_consistency_loss is None
-            or self.depth_clarity is None
-            or depth_latent is None
-            or depth_ids is None
-        ):
-            return None
-        clarity_map = self.depth_clarity(self._recover_images(pixel_values))
-        mask_probs = mask_logits.sigmoid()
-        return self.depth_consistency_loss(
-            depth_latent=depth_latent,
-            masks=mask_probs,
-            clarity_map=clarity_map,
-            depth_ids=depth_ids,
-        )

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import math
 import random
+import subprocess
 from collections import defaultdict
 from pathlib import Path
 import sys
@@ -107,6 +108,26 @@ def _resize_mask_to_size(mask: torch.Tensor, height: int, width: int) -> torch.T
     return resized.to(mask.dtype)
 
 
+def _git_value(args: list[str]) -> str:
+    try:
+        return subprocess.check_output(
+            ["git", *args],
+            cwd=str(CURRENT_DIR),
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return "unknown"
+
+
+def _extract_depth_from_batch(batch, device: torch.device):
+    if len(batch) < 7:
+        return None, None
+    depth_maps = batch[5].to(device, non_blocking=True)
+    depth_valid = batch[6].to(device, non_blocking=True)
+    return depth_maps, depth_valid
+
+
 def train_one_epoch(
     *,
     model: torch.nn.Module,
@@ -139,13 +160,20 @@ def train_one_epoch(
         images, masks, *_ = batch
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
+        depth_maps, depth_valid = _extract_depth_from_batch(batch, device)
         mask_labels, class_labels = _build_targets(
             masks, num_classes=num_classes, ignore_index=ignore_index
         )
         with amp.autocast(
             autocast_device, dtype=autocast_dtype, enabled=device.type == "cuda"
         ):
-            outputs = model(images, mask_labels=mask_labels, class_labels=class_labels)
+            outputs = model(
+                images,
+                mask_labels=mask_labels,
+                class_labels=class_labels,
+                depth_maps=depth_maps,
+                depth_valid=depth_valid,
+            )
             loss = outputs["loss"]
             if grad_accum_steps > 1:
                 loss = loss / grad_accum_steps
@@ -176,13 +204,9 @@ def train_one_epoch(
             if raw_losses:
                 wanted = {
                     k: raw_losses[k]
-                    for k in (
-                        "loss_mask",
-                        "loss_dice",
-                        "loss_cross_entropy",
-                        "depth_loss",
-                    )
-                    if k in raw_losses
+                    for k in raw_losses
+                    if k in {"loss_mask", "loss_dice", "loss_cross_entropy"}
+                    or k.startswith("depth_decoder/")
                 }
                 if wanted:
                     parts = []
@@ -232,6 +256,7 @@ def evaluate(
             images, masks, _indices, orig_sizes, *_ = batch
             images = images.to(device, non_blocking=True)
             masks = masks.to(device, non_blocking=True)
+            depth_maps, depth_valid = _extract_depth_from_batch(batch, device)
             mask_labels, class_labels = _build_targets(
                 masks, num_classes=num_classes, ignore_index=ignore_index
             )
@@ -239,7 +264,11 @@ def evaluate(
                 autocast_device, dtype=autocast_dtype, enabled=device.type == "cuda"
             ):
                 outputs = model(
-                    images, mask_labels=mask_labels, class_labels=class_labels
+                    images,
+                    mask_labels=mask_labels,
+                    class_labels=class_labels,
+                    depth_maps=depth_maps,
+                    depth_valid=depth_valid,
                 )
             loss_sum += float(outputs["loss"].item())
             count += 1
@@ -269,6 +298,8 @@ def evaluate(
                     device=device,
                     autocast_dtype=autocast_dtype,
                     target_size=(target_h, target_w),
+                    depth=depth_maps[b] if depth_maps is not None else None,
+                    depth_valid=depth_valid[b] if depth_valid is not None else None,
                 )
                 pred_mask = logits.argmax(dim=1).squeeze(0)
                 valid = target_mask_resized != ignore_index
@@ -386,7 +417,7 @@ def save_checkpoint(
     torch.save(state, path)
 
 
-def _few_shot_run_name_prefix(dataset_cfg: dict) -> str | None:
+def _few_shot_run_name_prefix(dataset_cfg: dict, training_cfg: dict | None = None) -> str | None:
     few_shot_cfg = dataset_cfg.get("few_shot") or {}
     if not bool(few_shot_cfg.get("enabled", False)):
         return None
@@ -394,6 +425,9 @@ def _few_shot_run_name_prefix(dataset_cfg: dict) -> str | None:
     num_samples = int(few_shot_cfg["num_samples"])
     seed = int(few_shot_cfg["seed"])
     prefix = f"{dataset_name}_{num_samples}shot_seed{seed}"
+    run_suffix = str((training_cfg or {}).get("run_suffix") or "").strip()
+    if run_suffix:
+        prefix = f"{prefix}_{run_suffix}"
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", prefix)
 
 
@@ -427,6 +461,119 @@ def _log_few_shot_dataset_info(logger, train_loader, val_loader) -> None:
     logger.log_message(f"[Dataset] few-shot manifest saved to: {manifest_path}")
 
 
+def _log_depth_dataset_info(logger, train_loader) -> None:
+    dataset = getattr(train_loader, "dataset", None)
+    depth_dir = getattr(dataset, "depth_dir", None)
+    if depth_dir is None and hasattr(dataset, "dataset"):
+        depth_dir = getattr(dataset.dataset, "depth_dir", None)
+    if depth_dir is None:
+        logger.log_message("[Depth] train_depths disabled")
+        return
+    matched = getattr(dataset, "depth_matched_count", None)
+    missing = getattr(dataset, "depth_missing_stems", [])
+    logger.log_message(
+        f"[Depth] train_depths={depth_dir} matched={matched} missing={len(missing)}"
+    )
+    if missing:
+        logger.log_message(f"[Depth] missing preview={', '.join(missing[:5])}")
+    sample_dataset = dataset.dataset if hasattr(dataset, "dataset") else dataset
+    sample_indices = getattr(dataset, "indices", range(min(3, len(sample_dataset))))
+    stats = []
+    for idx in list(sample_indices)[:3]:
+        depth_path = getattr(sample_dataset, "depth_paths", [None])[idx]
+        if depth_path is None:
+            continue
+        sample = torch.load(depth_path, map_location="cpu", weights_only=True)
+        depth = sample.get("depth") if isinstance(sample, dict) else sample
+        depth = torch.as_tensor(depth).float()
+        finite = torch.isfinite(depth)
+        if finite.any():
+            vals = depth[finite]
+            stats.append(
+                "{} shape={} min={:.4f} max={:.4f} mean={:.4f} std={:.4f}".format(
+                    Path(depth_path).name,
+                    tuple(depth.shape),
+                    float(vals.min()),
+                    float(vals.max()),
+                    float(vals.mean()),
+                    float(vals.std(unbiased=False)),
+                )
+            )
+    for line in stats:
+        logger.log_message(f"[Depth sample] {line}")
+
+
+def _log_depth_experiment_info(logger, cfg: dict, model: torch.nn.Module, config_path: str) -> None:
+    branch = _git_value(["rev-parse", "--abbrev-ref", "HEAD"])
+    commit = _git_value(["rev-parse", "HEAD"])
+    mask_cfg = cfg.get("mask2former", {})
+    logger.log_message(f"[Git] branch={branch} commit={commit} config={config_path}")
+    logger.log_message(
+        "[Depth decoder] enabled={} grid={} token_channels={} heads={} dropout={} gamma_mode={} gamma={}".format(
+            bool(mask_cfg.get("use_decoder_depth_cross_attention", False)),
+            int(mask_cfg.get("depth_token_grid", 8)),
+            int(mask_cfg.get("depth_token_channels", 64)),
+            int(mask_cfg.get("depth_cross_attention_heads", mask_cfg.get("num_heads", 8))),
+            float(mask_cfg.get("depth_cross_attention_dropout", 0.0)),
+            str(mask_cfg.get("depth_cross_attention_gamma_mode", "fixed")),
+            float(mask_cfg.get("depth_cross_attention_gamma", 1.0)),
+        )
+    )
+    logger.log_message(
+        "[Depth FF adapter] enabled={} bottleneck={} dropout={} gamma_mode={} gamma={}".format(
+            bool(mask_cfg.get("use_depth_ff_adapter", False)),
+            int(mask_cfg.get("depth_ff_adapter_bottleneck_dim", 64)),
+            float(mask_cfg.get("depth_ff_adapter_dropout", 0.0)),
+            str(mask_cfg.get("depth_ff_adapter_gamma_mode", "fixed")),
+            float(mask_cfg.get("depth_ff_adapter_gamma", 0.0)),
+        )
+    )
+    module = _unwrap(model)
+    transformer = getattr(module, "transformer_module", None)
+    encoder = getattr(transformer, "depth_token_encoder", None)
+    if encoder is not None:
+        params = sum(p.numel() for p in encoder.parameters())
+        trainable = sum(p.numel() for p in encoder.parameters() if p.requires_grad)
+        logger.log_message(f"[DepthTokenEncoder] params={params:,} trainable={trainable:,}")
+    layers = getattr(transformer, "decoder", None)
+    if layers is not None:
+        for idx, layer in enumerate(layers, start=1):
+            depth_attn = getattr(layer, "depth_attn", None)
+            if depth_attn is None:
+                continue
+            params = sum(p.numel() for p in depth_attn.parameters())
+            trainable = sum(p.numel() for p in depth_attn.parameters() if p.requires_grad)
+            gamma = getattr(layer, "gamma", None)
+            gamma_val = float(gamma.detach().cpu().item()) if torch.is_tensor(gamma) else float("nan")
+            logger.log_message(
+                f"[DepthCrossAttn {idx}] params={params:,} trainable={trainable:,} gamma={gamma_val:.4f}"
+            )
+            ff_down = getattr(layer, "ff_adapter_down", None)
+            ff_up = getattr(layer, "ff_adapter_up", None)
+            if ff_down is not None and ff_up is not None:
+                adapter_modules = [ff_down, ff_up]
+                adapter_params = sum(
+                    p.numel() for module_part in adapter_modules for p in module_part.parameters()
+                )
+                adapter_trainable = sum(
+                    p.numel()
+                    for module_part in adapter_modules
+                    for p in module_part.parameters()
+                    if p.requires_grad
+                )
+                ff_gamma = getattr(layer, "ff_gamma", None)
+                ff_gamma_val = (
+                    float(ff_gamma.detach().cpu().item())
+                    if torch.is_tensor(ff_gamma)
+                    else float("nan")
+                )
+                logger.log_message(
+                    f"[DepthFFAdapter {idx}] params={adapter_params:,} trainable={adapter_trainable:,} "
+                    f"bottleneck={getattr(layer, 'depth_ff_adapter_bottleneck_dim', 'n/a')} "
+                    f"gamma={ff_gamma_val:.4f}"
+                )
+
+
 def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
@@ -448,7 +595,7 @@ def main() -> None:
         checkpoint_subdir=train_cfg["checkpoint_dir"],
         weights_root=weights_cfg["storage_dir"],
         local_weights_root=weights_cfg["local_dir"],
-        run_name_prefix=_few_shot_run_name_prefix(dataset_cfg),
+        run_name_prefix=_few_shot_run_name_prefix(dataset_cfg, train_cfg),
     )
     if rank == 0:
         logger.log_config(cfg)
@@ -494,6 +641,7 @@ def main() -> None:
             )
         )
         logger.log_module_grad_status(unwrapped, label="model")
+        _log_depth_experiment_info(logger, cfg, model, args.config)
 
     train_loader, val_loader = build_segmentation_image_dataloaders_from_cfg(
         dataset_cfg,
@@ -503,6 +651,7 @@ def main() -> None:
     )
     if rank == 0:
         _log_few_shot_dataset_info(logger, train_loader, val_loader)
+        _log_depth_dataset_info(logger, train_loader)
 
     if distributed:
         model = DDP(
@@ -585,7 +734,10 @@ def main() -> None:
                 "optimizer/lr": optimizer.param_groups[0]["lr"],
             }
             for k, v in train_metrics.items():
-                scalars[f"train/{k}"] = v
+                if k.startswith("depth_decoder/"):
+                    scalars[k] = v
+                else:
+                    scalars[f"train/{k}"] = v
             if eval_results is not None:
                 eval_loss, miou = eval_results
                 scalars["eval/loss"] = eval_loss
@@ -604,6 +756,7 @@ def main() -> None:
                 _, miou = eval_results
                 if miou > best_miou:
                     best_miou = miou
+                    best_epoch = epoch
                     if (epoch + 1) >= save_after_epoch:
                         save_checkpoint(
                             best_ckpt_path, model, epoch, global_step, best_miou
@@ -636,6 +789,9 @@ def main() -> None:
             best_miou,
         )
         logger.log_message(f"最后一个 epoch 的权重已保存至: {last_ckpt_path}")
+        logger.log_message(
+            f"[Training Summary] best_mIoU={best_miou:.4f} best_epoch={locals().get('best_epoch', 'none')}"
+        )
 
     pred_dir_path = Path(pred_dir_setting)
     if not pred_dir_path.is_absolute():

@@ -52,29 +52,40 @@ def build_mask2former_config(
         output_auxiliary_logits=True,
     )
 
-    use_depth_embedding = bool(mask2former_cfg.get("use_depth_embedding", True))
-    if use_depth_embedding:
-        depth_groups = int(mask2former_cfg["depth_num_groups"])
-        if depth_groups <= 0:
-            raise ValueError("depth_num_groups 必须大于0")
-        if config.num_queries % depth_groups != 0:
-            raise ValueError(
-                f"num_queries({config.num_queries}) 无法被 depth_num_groups({depth_groups}) 整除"
-            )
-        per_group = config.num_queries // depth_groups
-        REQUIRED_GROUPS = 3
-        REQUIRED_PER_GROUP = 20
-        if depth_groups != REQUIRED_GROUPS or per_group != REQUIRED_PER_GROUP:
-            raise ValueError("当前实验要求将 query 分成 3 组且每组 20 个")
-
-        config.depth_num_groups = depth_groups
-        config.depth_loss_weight = float(mask2former_cfg["depth_loss_weight"])
-        config.depth_diversity_weight = float(mask2former_cfg["depth_diversity_weight"])
-    else:
-        config.depth_num_groups = 0
-        config.depth_loss_weight = 0.0
-        config.depth_diversity_weight = 0.0
-    config.use_depth_embedding = use_depth_embedding
+    config.use_decoder_depth_cross_attention = bool(
+        mask2former_cfg.get("use_decoder_depth_cross_attention", False)
+    )
+    config.depth_token_grid = int(mask2former_cfg.get("depth_token_grid", 8))
+    config.depth_token_channels = int(mask2former_cfg.get("depth_token_channels", 64))
+    config.depth_cross_attention_heads = int(
+        mask2former_cfg.get("depth_cross_attention_heads", mask2former_cfg.get("num_heads", 8))
+    )
+    config.depth_cross_attention_dropout = float(
+        mask2former_cfg.get("depth_cross_attention_dropout", 0.0)
+    )
+    config.depth_cross_attention_gamma_mode = str(
+        mask2former_cfg.get("depth_cross_attention_gamma_mode", "fixed")
+    )
+    config.depth_cross_attention_gamma = float(
+        mask2former_cfg.get("depth_cross_attention_gamma", 1.0)
+    )
+    config.depth_token_use_edge = bool(mask2former_cfg.get("depth_token_use_edge", True))
+    config.depth_token_use_valid = bool(mask2former_cfg.get("depth_token_use_valid", True))
+    config.use_depth_ff_adapter = bool(
+        mask2former_cfg.get("use_depth_ff_adapter", False)
+    )
+    config.depth_ff_adapter_bottleneck_dim = int(
+        mask2former_cfg.get("depth_ff_adapter_bottleneck_dim", max(1, hidden_dim // 4))
+    )
+    config.depth_ff_adapter_gamma_mode = str(
+        mask2former_cfg.get("depth_ff_adapter_gamma_mode", "fixed")
+    )
+    config.depth_ff_adapter_gamma = float(
+        mask2former_cfg.get("depth_ff_adapter_gamma", 0.0)
+    )
+    config.depth_ff_adapter_dropout = float(
+        mask2former_cfg.get("depth_ff_adapter_dropout", 0.0)
+    )
 
     transforms_cfg = dataset_cfg["transforms"] if dataset_cfg else {}
     mean = transforms_cfg["mean"] if transforms_cfg else None
