@@ -40,7 +40,7 @@ $$
 其中 $\alpha$ 为 LoRA scaling，`dropout` 施加于 $x$ 以缓解过拟合。脚本通过 `train.lora_layers` 控制注入层（可选最后 $n$ 层、显式 layer 列表或全层），并在 `train_m2f.py` 中仅对 LoRA 参数开启梯度，保证主干其他权重保持冻结但仍支持 DDP。
 
 ## 4. Mask2Former 变换器解码与主损失
-`DinoMask2Former` 复用 HF Mask2Former 的 transformer decoder，并将 depth-aware query embedding（`MAS/depth.py`）注入，使查询在语义与深度上可分。decoder 每层输出 `class_queries_logits`（形状 `[B, Q, num_classes+1]`，额外的 `no-object` 类保持匈牙利匹配所需）与 `masks_queries_logits`（`[B, Q, H, W]`），随后执行以下步骤：
+`DinoMask2Former` 复用 HF Mask2Former 的 transformer decoder。decoder 每层输出 `class_queries_logits`（形状 `[B, Q, num_classes+1]`，额外的 `no-object` 类保持匈牙利匹配所需）与 `masks_queries_logits`（`[B, Q, H, W]`），随后执行以下步骤：
 
 1. **匈牙利匹配**：`Mask2FormerLoss` 构造匹配 cost（分类 cost + 点采样 BCE cost + Dice cost），利用匈牙利算法将预测 query 与 GT 实例一一对齐。
 2. **主损失**：对匹配到的 query 计算
@@ -55,27 +55,10 @@ $$
    $$
    其中 $N$ 为匹配实例数，$P$ 为点采样位置数。多层 decoder 的辅助输出也重复该过程并按 `loss_weights` 加权。
 
-## 5. 深度一致性损失
-为了鼓励查询在深度维度上的分工，`QueryDepthConsistencyLoss` 在 `MAS/loss.py` 中实现以下过程：
-1. **Clarity 构建**：`LaplacianClarity` 将 RGB 输入反归一化、转灰度并卷积拉普拉斯核，得到归一化的清晰度图 $c_p$。
-2. **Query 深度估计**：每个 query 的 mask 概率 $m_{i,p}$ 对 clarity 图做加权平均，形成
-   $$
-   \hat{d}_i = \frac{\sum_p m_{i,p} c_p}{\sum_p m_{i,p} + 10^{-6}}.
-   $$
-3. **一致性与多样性**：learnable depth 标量 $d_i$ 通过
-   $$
-   \mathcal{L}_{depth} = \frac{1}{Q} \sum_{i=1}^{Q} |d_i - \hat{d}_i|
-   $$
-   与观测深度对齐；再按 near/mid/far 三组平均清晰度 $E_k$ 约束多样性
-   $$
-   \mathcal{L}_{div} = \sum_{k=1}^{3}\sum_{j=k+1}^{3} (E_k - E_j)^2.
-   $$
-   模块最终输出 $\mathcal{L}_{depth} + \lambda_{div}\mathcal{L}_{div}$，在 `MAS/mask2former/model.py` 中乘 `depth_loss_weight` 并记录为 `depth_loss`。
-
-## 6. 总体目标与训练策略
+## 5. 总体目标与训练策略
 综合上述损失，单个 batch 的优化目标可以写为
 $$
-\mathcal{L}_{total} = \lambda_{cls}\mathcal{L}_{cls} + \lambda_{mask}\mathcal{L}_{mask} + \lambda_{dice}\mathcal{L}_{dice} + \sum_{\ell}\lambda_{\ell}^{aux}\mathcal{L}_{\ell}^{aux} + \lambda_{depth}\left(\mathcal{L}_{depth} + \lambda_{div}\mathcal{L}_{div}\right),
+\mathcal{L}_{total} = \lambda_{cls}\mathcal{L}_{cls} + \lambda_{mask}\mathcal{L}_{mask} + \lambda_{dice}\mathcal{L}_{dice} + \sum_{\ell}\lambda_{\ell}^{aux}\mathcal{L}_{\ell}^{aux},
 $$
 其中 $\lambda$ 系数由 `DinoMask2Former.loss_weights` 与配置文件决定。`train_m2f.py` 采样的关键训练策略包括：
 - **优化器**：对可训练参数（LoRA + Mask2Former 头）使用 `AdamW`，学习率、动量、权重衰减均来源于配置。
@@ -83,11 +66,10 @@ $$
 - **调度器**：支持分数衰减、多步或余弦等策略，既可按 step 也可按 epoch 更新。
 - **分布式同步**：依赖 `torch.distributed` 与 `DistributedDataParallel`，通过 `_distributed_mean` 汇总 loss 与 mIoU。
 
-## 7. 日志、评估与导出
+## 6. 日志、评估与导出
 `init_training_logger` 负责 TensorBoard 记录与文本日志，关键指标含义如下：
 - `loss`：所有加权 loss 的总和；
 - `loss_mask / loss_dice / loss_cross_entropy`：主损失的未加权数值；
-- `depth_loss`：深度一致性损失未加权值；
 - `eval/miou`：验证集逐像素 mIoU。
 
 训练过程中按 `eval_interval` 周期运行 `evaluate`，同时维护最佳 mIoU checkpoint。最后一个 epoch 后会：

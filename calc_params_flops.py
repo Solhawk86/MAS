@@ -334,7 +334,6 @@ def summarize_encoder_decoder_params(model: nn.Module) -> dict[str, int]:
         "pixel_decoder",
         "transformer_module",
         "class_predictor",
-        "depth_consistency_loss",
     )
 
     encoder_total = _count_named_params_by_prefixes(model, encoder_prefixes)
@@ -462,7 +461,7 @@ def main() -> None:
     print(f"Input: [{args.batch_size}, 3, {args.height}, {args.width}]")
     print(f"Load Weights: {args.load_weights}")
     print("Encoder = feature_extractor (DINOv3_Adapter + backbone)")
-    print("Decoder = pixel_decoder + transformer_module + class_predictor (+depth_consistency_loss)")
+    print("Decoder = pixel_decoder + transformer_module + class_predictor")
     print(f"Params (M): {total_params / 1e6:.4f}")
     print(f"Trainable Params (M): {trainable_params / 1e6:.4f}")
     print(f"Frozen Params (M): {(total_params - trainable_params) / 1e6:.4f}")
