@@ -5,6 +5,7 @@ from MAS.model.Dino_LoRA import LoRA_qkv
 from MAS.mask2former.hf_pixel_decoder_custom import (
     DinoCompatibleMask2FormerPixelDecoder,
 )
+from MAS.mask2former.cddfuse_depth_prior_add import CDDFuseDepthPriorAdd
 from typing import Sequence
 from transformers.models.mask2former.modeling_mask2former import (
     Mask2FormerLoss,
@@ -32,6 +33,23 @@ class DinoMask2Former(torch.nn.Module):
             config,
             feature_channels=[int(embed_dim)] * len(self.feature_order),
         )
+        self.cddfuse_depth_prior_add = None
+        if bool(getattr(config, "use_cddfuse_depth_prior_add", False)):
+            self.cddfuse_depth_prior_add = CDDFuseDepthPriorAdd(
+                embed_dim=int(embed_dim),
+                feature_order=self.feature_order,
+                image_mean=getattr(config, "image_normalize_mean", None),
+                image_std=getattr(config, "image_normalize_std", None),
+                prior_channels=int(getattr(config, "cddfuse_prior_channels", 64)),
+                gamma_init=float(getattr(config, "cddfuse_gamma", 0.1)),
+                fusion_loss_weight=float(
+                    getattr(config, "cddfuse_fusion_loss_weight", 1.0)
+                ),
+                decomp_loss_weight=float(
+                    getattr(config, "cddfuse_decomp_loss_weight", 2.0)
+                ),
+                fusion_size=int(getattr(config, "cddfuse_fusion_size", 256)),
+            )
         self.transformer_module = Mask2FormerTransformerModule(
             in_features=config.feature_size,
             config=config,
@@ -59,8 +77,15 @@ class DinoMask2Former(torch.nn.Module):
         pixel_values: torch.Tensor,
         mask_labels: list[torch.Tensor] | None = None,
         class_labels: list[torch.Tensor] | None = None,
+        depth_maps: torch.Tensor | None = None,
     ):
         features_dict = self.adapter(pixel_values)
+        if self.cddfuse_depth_prior_add is not None:
+            features_dict = self.cddfuse_depth_prior_add(
+                pixel_values,
+                depth_maps,
+                features_dict,
+            )
         features = [
             features_dict[key] for key in self.feature_order if key in features_dict
         ]
@@ -71,6 +96,21 @@ class DinoMask2Former(torch.nn.Module):
                 if key in features_dict
             )
             print(f"[DINOv3 Adapter Features] {info}")
+            if self.cddfuse_depth_prior_add is not None:
+                gamma = ", ".join(
+                    f"{value:.4f}"
+                    for value in self.cddfuse_depth_prior_add.gamma.detach()
+                    .float()
+                    .cpu()
+                    .tolist()
+                )
+                print(
+                    "[CDDFuseDepthPriorAdd] enabled=True "
+                    f"prior_channels={self.cddfuse_depth_prior_add.pyramid[0].block[0].out_channels} "
+                    f"gamma=[{gamma}] fusion_loss_weight={self.cddfuse_depth_prior_add.fusion_loss_weight:.4f} "
+                    f"decomp_loss_weight={self.cddfuse_depth_prior_add.decomp_loss_weight:.4f} "
+                    f"fusion_size={self.cddfuse_depth_prior_add.fusion_size}"
+                )
             self._logged_feature_info = True
         decoder_out = self.pixel_decoder(
             features,
@@ -110,6 +150,17 @@ class DinoMask2Former(torch.nn.Module):
             raw_loss_dict = {k: v.detach() for k, v in loss_dict.items()}
             loss_dict = self._weight_detection_losses(loss_dict)
             loss = sum(loss_dict.values())
+            if self.cddfuse_depth_prior_add is not None:
+                aux_losses = self.cddfuse_depth_prior_add.auxiliary_losses()
+                raw_aux_losses = self.cddfuse_depth_prior_add.raw_losses()
+                for key, value in aux_losses.items():
+                    loss_dict[key] = value
+                    raw_loss_dict[key] = value.detach()
+                for key, value in raw_aux_losses.items():
+                    raw_loss_dict[key] = value.detach()
+                    loss_dict[key] = value.detach()
+                if aux_losses:
+                    loss = loss + sum(aux_losses.values())
         return {
             "loss": loss,
             "loss_dict": loss_dict,

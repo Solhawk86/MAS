@@ -107,6 +107,15 @@ def _resize_mask_to_size(mask: torch.Tensor, height: int, width: int) -> torch.T
     return resized.to(mask.dtype)
 
 
+def _extract_depth_maps(batch, device: torch.device) -> torch.Tensor | None:
+    if len(batch) < 6:
+        return None
+    depth_maps = batch[-1]
+    if not torch.is_tensor(depth_maps):
+        return None
+    return depth_maps.to(device, non_blocking=True)
+
+
 def train_one_epoch(
     *,
     model: torch.nn.Module,
@@ -139,13 +148,19 @@ def train_one_epoch(
         images, masks, *_ = batch
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
+        depth_maps = _extract_depth_maps(batch, device)
         mask_labels, class_labels = _build_targets(
             masks, num_classes=num_classes, ignore_index=ignore_index
         )
         with amp.autocast(
             autocast_device, dtype=autocast_dtype, enabled=device.type == "cuda"
         ):
-            outputs = model(images, mask_labels=mask_labels, class_labels=class_labels)
+            outputs = model(
+                images,
+                mask_labels=mask_labels,
+                class_labels=class_labels,
+                depth_maps=depth_maps,
+            )
             loss = outputs["loss"]
             if grad_accum_steps > 1:
                 loss = loss / grad_accum_steps
@@ -180,6 +195,26 @@ def train_one_epoch(
                         "loss_mask",
                         "loss_dice",
                         "loss_cross_entropy",
+                        "loss_cddfuse_fusion",
+                        "loss_cddfuse_decomp",
+                        "loss_cddfuse_total",
+                        "loss_cddfuse_fusion_raw",
+                        "loss_cddfuse_decomp_raw",
+                        "loss_cddfuse_in",
+                        "loss_cddfuse_grad",
+                        "cddfuse/base_cc",
+                        "cddfuse/detail_cc",
+                        "cddfuse/gray_mean",
+                        "cddfuse/depth_mean",
+                        "cddfuse/fused_img_mean",
+                        "cddfuse/fused_img_std",
+                        "cddfuse/gamma_mean",
+                        "cddfuse/gamma_level_1",
+                        "cddfuse/gamma_level_2",
+                        "cddfuse/gamma_level_3",
+                        "cddfuse/gamma_level_4",
+                        "cddfuse/prior_strength",
+                        "cddfuse/contribution_strength",
                     )
                     if k in raw_losses
                 }
@@ -231,6 +266,7 @@ def evaluate(
             images, masks, _indices, orig_sizes, *_ = batch
             images = images.to(device, non_blocking=True)
             masks = masks.to(device, non_blocking=True)
+            depth_maps = _extract_depth_maps(batch, device)
             mask_labels, class_labels = _build_targets(
                 masks, num_classes=num_classes, ignore_index=ignore_index
             )
@@ -238,7 +274,10 @@ def evaluate(
                 autocast_device, dtype=autocast_dtype, enabled=device.type == "cuda"
             ):
                 outputs = model(
-                    images, mask_labels=mask_labels, class_labels=class_labels
+                    images,
+                    mask_labels=mask_labels,
+                    class_labels=class_labels,
+                    depth_maps=depth_maps,
                 )
             loss_sum += float(outputs["loss"].item())
             count += 1
@@ -263,6 +302,7 @@ def evaluate(
                 logits = _run_full_image_inference(
                     model,
                     images[b],
+                    depth_map=depth_maps[b] if depth_maps is not None else None,
                     eval_params=eval_params,
                     num_classes=num_classes,
                     device=device,

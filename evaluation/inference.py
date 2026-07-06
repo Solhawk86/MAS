@@ -31,10 +31,11 @@ def _forward_semantic_logits(
     *,
     device: torch.device,
     autocast_dtype: torch.dtype,
+    depth_maps: torch.Tensor | None = None,
 ) -> torch.Tensor:
     autocast_device = "cuda" if device.type == "cuda" else "cpu"
     with amp.autocast(autocast_device, dtype=autocast_dtype, enabled=device.type == "cuda"):
-        outputs = model(images)
+        outputs = model(images, depth_maps=depth_maps)
     return _semantic_from_logits(outputs["class_queries_logits"], outputs["masks_queries_logits"])
 
 
@@ -47,6 +48,7 @@ def _slide_inference(
     num_classes: int,
     device: torch.device,
     autocast_dtype: torch.dtype,
+    depth_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
     _, h_img, w_img = image.shape
     h_crop, w_crop = crop_size
@@ -64,7 +66,16 @@ def _slide_inference(
             y1 = max(y2 - h_crop, 0)
             x1 = max(x2 - w_crop, 0)
             crop = image[:, y1:y2, x1:x2].unsqueeze(0)
-            crop_logits = _forward_semantic_logits(model, crop, device=device, autocast_dtype=autocast_dtype)
+            depth_crop = None
+            if depth_map is not None:
+                depth_crop = depth_map[:, y1:y2, x1:x2].unsqueeze(0)
+            crop_logits = _forward_semantic_logits(
+                model,
+                crop,
+                device=device,
+                autocast_dtype=autocast_dtype,
+                depth_maps=depth_crop,
+            )
             crop_logits = F.interpolate(
                 crop_logits,
                 size=(y2 - y1, x2 - x1),
@@ -76,10 +87,14 @@ def _slide_inference(
     return preds / torch.clamp(count, min=1.0)
 
 
-def _build_tta_views(image: torch.Tensor, eval_params: dict) -> list[tuple[torch.Tensor, bool]]:
+def _build_tta_views(
+    image: torch.Tensor,
+    eval_params: dict,
+    depth_map: torch.Tensor | None = None,
+) -> list[tuple[torch.Tensor, torch.Tensor | None, bool]]:
     ratios = eval_params.get("tta_ratios") or [1.0]
     use_hflip = bool(eval_params.get("use_tta", False))
-    views: list[tuple[torch.Tensor, bool]] = []
+    views: list[tuple[torch.Tensor, torch.Tensor | None, bool]] = []
     for ratio in ratios:
         if isinstance(ratio, (int, float)) and ratio > 0:
             if abs(float(ratio) - 1.0) < 1e-6:
@@ -93,11 +108,27 @@ def _build_tta_views(image: torch.Tensor, eval_params: dict) -> list[tuple[torch
                     mode="bilinear",
                     align_corners=False,
                 ).squeeze(0)
+                if depth_map is not None:
+                    scaled_depth = F.interpolate(
+                        depth_map.unsqueeze(0),
+                        size=(h, w),
+                        mode="bilinear",
+                        align_corners=False,
+                    ).squeeze(0)
+                else:
+                    scaled_depth = None
+            if depth_map is not None and abs(float(ratio) - 1.0) < 1e-6:
+                scaled_depth = depth_map
         else:
             raise ValueError(f"非法 tta ratio: {ratio}")
-        views.append((scaled, False))
+        views.append((scaled, scaled_depth if depth_map is not None else None, False))
         if use_hflip:
-            views.append((torch.flip(scaled, dims=[-1]), True))
+            flipped_depth = (
+                torch.flip(scaled_depth, dims=[-1])
+                if depth_map is not None and scaled_depth is not None
+                else None
+            )
+            views.append((torch.flip(scaled, dims=[-1]), flipped_depth, True))
     return views
 
 
@@ -110,6 +141,7 @@ def _predict_single_view(
     device: torch.device,
     autocast_dtype: torch.dtype,
     target_size: tuple[int, int],
+    depth_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
     inference_mode = str(eval_params.get("inference_mode", "slide")).lower() or "slide"
     crop_hw = _resolve_hw_pair(eval_params.get("crop_size") or eval_params.get("img_size"), default=view.shape[-2:])
@@ -126,6 +158,7 @@ def _predict_single_view(
             num_classes=num_classes,
             device=device,
             autocast_dtype=autocast_dtype,
+            depth_map=depth_map,
         )
     else:
         resized = F.interpolate(
@@ -134,7 +167,21 @@ def _predict_single_view(
             mode="bilinear",
             align_corners=False,
         )
-        logits = _forward_semantic_logits(model, resized, device=device, autocast_dtype=autocast_dtype)
+        resized_depth = None
+        if depth_map is not None:
+            resized_depth = F.interpolate(
+                depth_map.unsqueeze(0),
+                size=crop_hw,
+                mode="bilinear",
+                align_corners=False,
+            )
+        logits = _forward_semantic_logits(
+            model,
+            resized,
+            device=device,
+            autocast_dtype=autocast_dtype,
+            depth_maps=resized_depth,
+        )
     return F.interpolate(logits, size=target_size, mode="bilinear", align_corners=False)
 
 
@@ -147,11 +194,12 @@ def _run_full_image_inference(
     device: torch.device,
     autocast_dtype: torch.dtype,
     target_size: tuple[int, int],
+    depth_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    views = _build_tta_views(image, eval_params)
+    views = _build_tta_views(image, eval_params, depth_map)
     view_count = len(views)
     aggregated: torch.Tensor | None = None
-    for view, flipped in views:
+    for view, depth_view, flipped in views:
         logits = _predict_single_view(
             model,
             view,
@@ -160,6 +208,7 @@ def _run_full_image_inference(
             device=device,
             autocast_dtype=autocast_dtype,
             target_size=target_size,
+            depth_map=depth_view,
         )
         if flipped:
             logits = torch.flip(logits, dims=[-1])
@@ -173,6 +222,7 @@ def _run_full_image_inference(
             device=device,
             autocast_dtype=autocast_dtype,
             target_size=target_size,
+            depth_map=depth_map,
         )
         view_count = 1
     return aggregated / float(view_count)
@@ -212,7 +262,10 @@ def export_predictions(
         for batch in loader:
             images, _masks, sample_indices, orig_sizes, *rest = batch
             file_names = rest[0] if rest else None
+            depth_maps = rest[1] if len(rest) > 1 and torch.is_tensor(rest[1]) else None
             images = images.to(device, non_blocking=True)
+            if depth_maps is not None:
+                depth_maps = depth_maps.to(device, non_blocking=True)
             batch_size = images.shape[0]
             for b in range(batch_size):
                 target_h = int(orig_sizes[b][0].item())
@@ -222,6 +275,7 @@ def export_predictions(
                 logits = _run_full_image_inference(
                     model,
                     images[b],
+                    depth_map=depth_maps[b] if depth_maps is not None else None,
                     eval_params=eval_params,
                     num_classes=num_classes,
                     device=device,

@@ -59,6 +59,21 @@ def build_mask2former_config(
         config.image_normalize_mean = list(mean)
         config.image_normalize_std = list(std)
 
+    config.use_cddfuse_depth_prior_add = bool(
+        mask2former_cfg.get("use_cddfuse_depth_prior_add", False)
+    )
+    config.cddfuse_gamma = float(mask2former_cfg.get("cddfuse_gamma", 0.1))
+    config.cddfuse_fusion_loss_weight = float(
+        mask2former_cfg.get("cddfuse_fusion_loss_weight", 1.0)
+    )
+    config.cddfuse_decomp_loss_weight = float(
+        mask2former_cfg.get("cddfuse_decomp_loss_weight", 2.0)
+    )
+    config.cddfuse_prior_channels = int(
+        mask2former_cfg.get("cddfuse_prior_channels", 64)
+    )
+    config.cddfuse_fusion_size = int(mask2former_cfg.get("cddfuse_fusion_size", 256))
+
     return config
 
 
