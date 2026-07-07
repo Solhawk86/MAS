@@ -84,7 +84,9 @@ def _infer_dataset_name(dataset_cfg: dict) -> str:
             # /.../<dataset>/train/<images>
             candidate = parts[-3]
         else:
-            candidate = train_images_path.parent.parent.name or train_images_path.parent.name
+            candidate = (
+                train_images_path.parent.parent.name or train_images_path.parent.name
+            )
         candidate = str(candidate).strip().lower()
         if candidate:
             return re.sub(r"[^A-Za-z0-9_.-]+", "_", candidate)
@@ -652,16 +654,16 @@ def main() -> None:
                         )
                     else:
                         logger.log_message(f"新的最佳 mIoU={best_miou:.4f}")
-            if (epoch + 1) % 5 == 0:
-                periodic_ckpt_path = logger.checkpoint_dir / f"epoch_{epoch + 1:03d}.pt"
-                save_checkpoint(
-                    periodic_ckpt_path,
-                    model,
-                    epoch,
-                    global_step,
-                    best_miou,
-                )
-                logger.log_message(f"按固定间隔保存 checkpoint: {periodic_ckpt_path}")
+            # if (epoch + 1) % 5 == 0:
+            #     periodic_ckpt_path = logger.checkpoint_dir / f"epoch_{epoch + 1:03d}.pt"
+            #     save_checkpoint(
+            #         periodic_ckpt_path,
+            #         model,
+            #         epoch,
+            #         global_step,
+            #         best_miou,
+            #     )
+            #     logger.log_message(f"按固定间隔保存 checkpoint: {periodic_ckpt_path}")
         last_epoch = epoch
         if distributed:
             dist.barrier()
