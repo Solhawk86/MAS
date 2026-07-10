@@ -134,8 +134,8 @@ mask2former:
   importance_sample_ratio: 0.75
   use_cddfuse_depth_prior_add: true
   cddfuse_gamma: 0.1
-  cddfuse_fusion_loss_weight: 1.0
-  cddfuse_decomp_loss_weight: 2.0
+  cddfuse_fusion_loss_weight: 0.0
+  cddfuse_decomp_loss_weight: 0.0
   cddfuse_prior_channels: 64
   cddfuse_fusion_size: 256
 evaluation:
