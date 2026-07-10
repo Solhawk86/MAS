@@ -340,6 +340,8 @@ class CDDFuseDepthPriorAdd(nn.Module):
         c = int(prior_channels)
         self.encoder = RestormerEncoder(inp_channels=1, dim=c)
         self.decoder = RestormerDecoder(out_channels=1, dim=c)
+        self.decoder.encoder_level2.requires_grad_(False)
+        self.decoder.output.requires_grad_(False)
         self.base_fuse = BaseFeatureExtraction(dim=c, num_heads=8)
         self.detail_fuse = DetailFeatureExtraction(num_layers=1)
 
@@ -392,7 +394,7 @@ class CDDFuseDepthPriorAdd(nn.Module):
         fused_detail = self.detail_fuse(vis_detail + dep_detail)
         fused_img, fused_feature = self.decoder(gray, fused_base, fused_detail)
 
-        prior_pyramid = self._build_prior_pyramid(fused_feature.detach())
+        prior_pyramid = self._build_prior_pyramid(fused_feature)
         fused = dict(features_dict)
         prior_abs_values: list[torch.Tensor] = []
         target_abs_values: list[torch.Tensor] = []
@@ -427,7 +429,7 @@ class CDDFuseDepthPriorAdd(nn.Module):
         return fused
 
     def auxiliary_losses(self) -> dict[str, torch.Tensor]:
-        return dict(self.last_losses)
+        return {}
 
     def raw_losses(self) -> dict[str, torch.Tensor]:
         return dict(self.last_raw_losses)
@@ -508,15 +510,11 @@ class CDDFuseDepthPriorAdd(nn.Module):
         base_cc = _cc(vis_base, dep_base)
         detail_cc = _cc(vis_detail, dep_detail)
         decomp_loss = detail_cc.pow(2) / (1.01 + base_cc)
-        weighted_fusion = fusion_loss * self.fusion_loss_weight
-        weighted_decomp = decomp_loss * self.decomp_loss_weight
-        total = weighted_fusion + weighted_decomp
-        self.last_losses = {
-            "loss_cddfuse_fusion": weighted_fusion,
-            "loss_cddfuse_decomp": weighted_decomp,
-            "loss_cddfuse_total": total,
-        }
+        self.last_losses = {}
         self.last_raw_losses = {
+            "loss_cddfuse_fusion": fusion_loss.detach(),
+            "loss_cddfuse_decomp": decomp_loss.detach(),
+            "loss_cddfuse_total": (fusion_loss + decomp_loss).detach(),
             "loss_cddfuse_fusion_raw": fusion_loss.detach(),
             "loss_cddfuse_decomp_raw": decomp_loss.detach(),
             "loss_cddfuse_in": loss_in.detach(),
