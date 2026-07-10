@@ -120,6 +120,8 @@ mask2former:
   enforce_input_projection: false
   common_stride: 4
   num_queries: 60
+  use_depth_embedding: true
+  depth_num_groups: 3
   num_heads: 8
   encoder_layers: 6
   decoder_layers: 9
@@ -127,6 +129,8 @@ mask2former:
   mask_weight: 5.0
   dice_weight: 5.0
   no_object_weight: 0.1
+  depth_loss_weight: 1
+  depth_diversity_weight: 0
   train_num_points: 12544
   oversample_ratio: 3.0
   importance_sample_ratio: 0.75
